@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket Clone Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths to match the VPS deployment.
+User=clonetrader
+WorkingDirectory=/opt/clone-trader
+# The .env file holds all secrets; it is loaded by config.py via python-dotenv.
+EnvironmentFile=/opt/clone-trader/.env
+ExecStart=/opt/clone-trader/.venv/bin/python -u main.py
+Restart=on-failure
+RestartSec=5
+# Log to the journal (view with: journalctl -u clone-trader -f).
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening (safe defaults for a network client) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
