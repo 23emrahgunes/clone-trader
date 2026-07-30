@@ -47,10 +47,16 @@ class PolymarketTrader:
     """Thin async wrapper around a single keep-alive ``ClobClient``."""
 
     def __init__(self) -> None:
-        # Build the client once with the signing key + proxy (funder) from config.
-        # If explicit L2 API credentials are supplied in the env, pass them straight
-        # to the constructor; otherwise the client starts credential-less and
-        # derive_api_key() is called lazily in connect().
+        # The ClobClient (and thus the private-key parsing Signer) is built lazily
+        # in connect(), NOT here. This lets paper / DRY_RUN mode run with no valid
+        # PRIVATE_KEY at all, since it never signs or places an order.
+        self._client: Optional[ClobClient] = None
+        self._connected: bool = False
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def _build_client(self) -> ClobClient:
+        """Construct the ClobClient. Parses PRIVATE_KEY, so only called on demand."""
         preset_creds: Optional[ApiCreds] = None
         if settings.has_clob_creds:
             preset_creds = ApiCreds(
@@ -58,8 +64,7 @@ class PolymarketTrader:
                 api_secret=settings.CLOB_API_SECRET,
                 api_passphrase=settings.CLOB_API_PASSPHRASE,
             )
-
-        self._client: ClobClient = ClobClient(
+        client = ClobClient(
             host=settings.CLOB_HOST,
             chain_id=settings.CHAIN_ID,
             key=settings.PRIVATE_KEY,
@@ -67,17 +72,19 @@ class PolymarketTrader:
             signature_type=settings.SIGNATURE_TYPE,  # from .env (default 3)
             funder=settings.PROXY_WALLET_ADDRESS,
         )
-        # Already authenticated at construction time when creds came from the env.
-        self._connected: bool = preset_creds is not None
-
-    # -- lifecycle -----------------------------------------------------------
+        # Authenticated already when creds came straight from the env.
+        self._connected = preset_creds is not None
+        return client
 
     async def connect(self) -> None:
-        """Ensure L2 API credentials are attached (idempotent). Must run before trading.
+        """Build the client (if needed) and ensure L2 API credentials are attached.
 
-        No-op when credentials were injected from the env at construction time;
-        otherwise derives them from the private key via derive_api_key().
+        Builds the ClobClient on first use, then derives credentials from the
+        private key via derive_api_key() unless they were injected from the env.
+        Only reached on a real trade or a balance query — never in paper mode.
         """
+        if self._client is None:
+            self._client = await asyncio.to_thread(self._build_client)
         if self._connected:
             return
         try:
