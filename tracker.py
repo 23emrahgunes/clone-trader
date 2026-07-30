@@ -102,7 +102,7 @@ class WhaleTracker:
         self,
         callback: TradeCallback,
         *,
-        poll_interval_s: float = 3.0,
+        poll_interval_s: float = 15.0,
         journal_path: str = "whale_activity.jsonl",
         dedup_maxlen: int = 5000,
     ) -> None:
@@ -297,7 +297,15 @@ class WhaleTracker:
     # -- source 2: data-api polling backfill ---------------------------------
 
     async def _poll_loop(self) -> None:
-        """Poll /activity for the target wallet as a safety net for missed WS events."""
+        """Poll /activity for the target wallet as a safety net for missed WS events.
+
+        The WS firehose is the low-latency path; this poll is only a backfill, so
+        it runs at a relaxed interval and backs off exponentially on HTTP 429
+        (rate limit) to stay well within the public API's limits.
+        """
+        base = self._poll_interval_s
+        delay = base
+        max_delay = 120.0
         async with httpx.AsyncClient(timeout=15.0) as client:
             while not self._stopping.is_set():
                 # Rebuilt each iteration so a runtime /set_target is picked up.
@@ -308,18 +316,25 @@ class WhaleTracker:
                     "sortBy": "TIMESTAMP",
                     "sortDirection": "DESC",
                 }
+                batch = None
                 try:
                     resp = await client.get(DATA_API_ACTIVITY_URL, params=params)
                     resp.raise_for_status()
                     batch = resp.json()
+                    delay = base  # healthy response -> reset backoff
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 429:
+                        delay = min(max(delay * 2, base * 2), max_delay)
+                        logger.warning("data-api rate-limited (429); backing off to %.0fs", delay)
+                    else:
+                        logger.warning("data-api poll HTTP error: %s", exc)
                 except (httpx.HTTPError, ValueError) as exc:
                     logger.warning("data-api poll failed: %s", exc)
-                    batch = None
 
                 if isinstance(batch, list):
                     await self._ingest_poll_batch(batch)
 
-                await self._sleep_or_stop(self._poll_interval_s)
+                await self._sleep_or_stop(delay)
 
     async def _ingest_poll_batch(self, batch: list) -> None:
         """Emit new trades from a poll batch; the first batch only seeds baseline."""
