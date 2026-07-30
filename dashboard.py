@@ -1,0 +1,140 @@
+"""Lightweight web dashboard for paper-trade PnL.
+
+Serves a single auto-refreshing HTML page plus a JSON API, backed by the
+PaperLedger. Runs in-process as another asyncio task alongside the bot, so
+`pm2` keeps it alive with everything else.
+
+Security: if ``DASHBOARD_TOKEN`` is set, every request must carry ``?key=<token>``.
+The page is read-only (PnL numbers only — no secrets, no order controls), but
+since it may be exposed on a public IP you should set a token.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from aiohttp import web
+
+from paper import PaperLedger
+
+logger = logging.getLogger(__name__)
+
+_PAGE = """<!doctype html>
+<html lang="tr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clone Trader — Paper PnL</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background:#0d1117; color:#e6edf3;
+         margin:0; padding:24px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#8b949e; font-size:13px; margin-bottom:20px; }
+  .cards { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:10px;
+          padding:16px 20px; min-width:130px; }
+  .card .label { color:#8b949e; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .value { font-size:24px; font-weight:600; margin-top:6px; }
+  .pos { color:#3fb950; } .neg { color:#f85149; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:right; padding:10px 12px; border-bottom:1px solid #21262d; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:#8b949e; font-weight:500; text-transform:uppercase; font-size:11px; letter-spacing:.04em; }
+  .muted { color:#6e7681; }
+  .wrap { overflow-x:auto; border:1px solid #30363d; border-radius:10px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:6px; }
+</style></head><body>
+  <h1><span class="dot"></span>Clone Trader — Paper PnL</h1>
+  <div class="sub" id="meta">yükleniyor…</div>
+  <div class="cards" id="cards"></div>
+  <div class="wrap"><table>
+    <thead><tr>
+      <th>Pazar</th><th>Yön</th><th>Giriş</th><th>Size</th>
+      <th>Maliyet</th><th>Güncel</th><th>Değer</th><th>PnL</th>
+    </tr></thead><tbody id="rows"></tbody>
+  </table></div>
+<script>
+const key = new URLSearchParams(location.search).get('key');
+const money = v => (v===null||v===undefined) ? '—' : '$'+Number(v).toFixed(2);
+const cls = v => v>0 ? 'pos' : (v<0 ? 'neg' : '');
+async function refresh(){
+  try {
+    const r = await fetch('/api/pnl' + (key ? ('?key='+encodeURIComponent(key)) : ''));
+    if(!r.ok){ document.getElementById('meta').textContent='API hata: '+r.status; return; }
+    const d = await r.json();
+    const t = d.totals;
+    document.getElementById('cards').innerHTML = [
+      ['İşlem', t.count],
+      ['Maliyet', money(t.cost)],
+      ['Güncel Değer', money(t.value)],
+      ['PnL', '<span class="'+cls(t.pnl)+'">'+money(t.pnl)+'</span>'],
+      ['PnL %', '<span class="'+cls(t.pnl)+'">'+t.pnl_pct.toFixed(2)+'%</span>'],
+    ].map(([l,v])=>'<div class="card"><div class="label">'+l+'</div><div class="value">'+v+'</div></div>').join('');
+    document.getElementById('rows').innerHTML = d.rows.slice().reverse().map(p=>{
+      const t = new Date(p.ts).toLocaleString('tr-TR');
+      return '<tr><td>'+(p.market||p.token_id.slice(0,10))+'<div class="muted" style="font-size:11px">'+t+'</div></td>'+
+        '<td>'+p.side+'</td><td>'+Number(p.entry_price).toFixed(3)+'</td><td>'+p.size+'</td>'+
+        '<td>'+money(p.cost_usdc)+'</td>'+
+        '<td>'+(p.current_price===null?'—':Number(p.current_price).toFixed(3))+'</td>'+
+        '<td>'+money(p.current_value)+'</td>'+
+        '<td class="'+cls(p.pnl)+'">'+money(p.pnl)+'</td></tr>';
+    }).join('') || '<tr><td colspan="8" class="muted">Henüz paper işlem yok — balina hareketi bekleniyor.</td></tr>';
+    document.getElementById('meta').textContent =
+      'Son güncelleme: ' + new Date(d.generated_at).toLocaleTimeString('tr-TR') + ' · 10 sn\\'de bir yenilenir';
+  } catch(e){ document.getElementById('meta').textContent = 'Bağlantı hatası'; }
+}
+refresh(); setInterval(refresh, 10000);
+</script></body></html>"""
+
+
+class Dashboard:
+    """aiohttp web server exposing the paper PnL page + JSON API."""
+
+    def __init__(
+        self,
+        ledger: PaperLedger,
+        *,
+        host: str = "0.0.0.0",
+        port: int = 8080,
+        token: Optional[str] = None,
+    ) -> None:
+        self._ledger = ledger
+        self._host = host
+        self._port = port
+        self._token = token
+        self._runner: Optional[web.AppRunner] = None
+
+    def _authorized(self, request: web.Request) -> bool:
+        if not self._token:
+            return True
+        return request.query.get("key") == self._token
+
+    async def _index(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.Response(status=401, text="unauthorized")
+        return web.Response(text=_PAGE, content_type="text/html")
+
+    async def _api(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            data = await self._ledger.compute_pnl()
+        except Exception:  # noqa: BLE001 - dashboard must not crash the process
+            logger.exception("compute_pnl failed")
+            return web.json_response({"error": "compute_failed"}, status=500)
+        return web.json_response(data)
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.router.add_get("/", self._index)
+        app.router.add_get("/api/pnl", self._api)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._host, self._port)
+        await site.start()
+        logger.info("Dashboard listening on http://%s:%d (auth=%s)",
+                    self._host, self._port, "on" if self._token else "off")
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()

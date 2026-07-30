@@ -24,6 +24,8 @@ import signal
 
 from bot import TelegramBot
 from config import settings
+from dashboard import Dashboard
+from paper import PaperLedger
 from tracker import WhaleTracker, WhaleTrade
 from trader import PolymarketTrader
 
@@ -49,6 +51,13 @@ class Orchestrator:
         self.tracker = WhaleTracker(self._copy_decision)
         # Keep tracker and state aligned at startup.
         self.tracker.target_wallet = self.state.target_wallet
+        # Paper ledger + web dashboard for simulated PnL.
+        self.paper = PaperLedger()
+        self.dashboard = Dashboard(
+            self.paper,
+            port=settings.DASHBOARD_PORT,
+            token=settings.DASHBOARD_TOKEN,
+        )
 
     # -- hooks injected into the bot -----------------------------------------
 
@@ -81,14 +90,17 @@ class Orchestrator:
             logger.info("Skip %s (only BUY is copied)", trade.side)
             return
 
-        # 3a. Paper / simulation mode.
+        # 3a. Paper / simulation mode: record the position for PnL tracking.
         if self.state.dry_run:
-            logger.info("[PAPER] would buy 1 USDC of %s @ %.4f", trade.token_id, trade.price)
+            pos = self.paper.record_buy(trade)
+            logger.info("[PAPER] recorded 1 USDC buy of %s @ %.4f (size=%.2f)",
+                        trade.token_id, trade.price, pos["size"])
             await self.bot._send(
                 "🧪 [SIMULATION / PAPER] Kopya emri simüle edildi (borsaya gönderilmedi).\n"
                 f"Pazar: {trade.slug or trade.condition_id}\n"
                 f"Fiyat: {trade.price}\n"
-                f"Tutar (balina): {trade.size}"
+                f"Size: {pos['size']} (~{pos['cost_usdc']} USDC)\n"
+                f"📊 PnL: dashboard'da izle"
             )
             return
 
@@ -116,6 +128,7 @@ class Orchestrator:
         )
 
         await self.bot.start()
+        await self.dashboard.start()
         tracker_task = asyncio.create_task(self.tracker.run(), name="tracker")
 
         stop = asyncio.Event()
@@ -160,6 +173,9 @@ class Orchestrator:
         tracker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await tracker_task
+
+        with contextlib.suppress(Exception):
+            await self.dashboard.stop()
 
         with contextlib.suppress(Exception):
             await self.bot.stop()

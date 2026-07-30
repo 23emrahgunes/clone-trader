@@ -119,6 +119,11 @@ class Settings:
     # When True the bot only tracks/logs and never sends real orders (paper mode).
     DRY_RUN: bool = True
 
+    # --- Paper PnL dashboard ---
+    DASHBOARD_PORT: int = 8080
+    # If set, the dashboard requires ?key=<token>. Recommended on a public IP.
+    DASHBOARD_TOKEN: Optional[str] = None
+
     # --- Business rules (see .skills) ---
     FIXED_ALLOCATION_USDC: float = 1.0
     MAX_SLIPPAGE_PCT: float = 3.0
@@ -147,6 +152,8 @@ class Settings:
             TELEGRAM_ADMIN_ID=_require_int("TELEGRAM_ADMIN_ID"),
             TARGET_WALLET=_require("TARGET_WALLET"),
             DRY_RUN=_get_bool("DRY_RUN", True),
+            DASHBOARD_PORT=_get_int("DASHBOARD_PORT", 8080),
+            DASHBOARD_TOKEN=_optional("DASHBOARD_TOKEN"),
             FIXED_ALLOCATION_USDC=_get_float("FIXED_ALLOCATION_USDC", 1.0),
             MAX_SLIPPAGE_PCT=_get_float("MAX_SLIPPAGE_PCT", 3.0),
             MIN_ORDER_USDC=_get_float("MIN_ORDER_USDC", 1.0),
