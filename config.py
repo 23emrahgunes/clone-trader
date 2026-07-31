@@ -95,9 +95,13 @@ class Settings:
 
     # --- Polymarket CLOB ---
     CLOB_HOST: str = "https://clob.polymarket.com"
-    # Proxy wallet signature type: 1 = POLY_PROXY (email/magic), 2 = POLY_GNOSIS_SAFE,
-    # 3 = POLY_PROXY (browser/relayer). Default 3 to match the user's working setup.
-    SIGNATURE_TYPE: int = 3
+    # Signature type — ONLY 0, 1, 2 are valid; anything else makes py-clob-client
+    # reject the order client-side with "Invalid order inputs".
+    #   0 = EOA           -> trade directly from the key's own wallet (funder = self)
+    #   1 = POLY_PROXY    -> Polymarket email / Magic login proxy wallet
+    #   2 = POLY_GNOSIS_SAFE -> MetaMask / browser-wallet Polymarket account (Safe)
+    # Default 0 to match the proven-working 3_execution_agent bot on this machine.
+    SIGNATURE_TYPE: int = 0
 
     # --- CLOB L2 API credentials (optional) ---
     # If all three are present they are used directly as ApiCreds; otherwise they
@@ -168,7 +172,7 @@ class Settings:
             RPC_URL=_require("RPC_URL"),
             CHAIN_ID=_get_int("CHAIN_ID", 137),
             CLOB_HOST=_optional("CLOB_HOST", "https://clob.polymarket.com") or "https://clob.polymarket.com",
-            SIGNATURE_TYPE=_get_int("SIGNATURE_TYPE", 3),
+            SIGNATURE_TYPE=_get_int("SIGNATURE_TYPE", 0),
             CLOB_API_KEY=_optional("CLOB_API_KEY"),
             CLOB_API_SECRET=_optional("CLOB_API_SECRET"),
             CLOB_API_PASSPHRASE=_optional("CLOB_API_PASSPHRASE"),
@@ -189,6 +193,14 @@ class Settings:
             raise ConfigError(
                 "No copy targets configured. Set TARGET_WALLET or TARGET_WALLETS "
                 "(comma-separated) in .env."
+            )
+        if inst.SIGNATURE_TYPE not in (0, 1, 2):
+            raise ConfigError(
+                f"SIGNATURE_TYPE={inst.SIGNATURE_TYPE} is invalid. Polymarket only "
+                "accepts 0 (EOA), 1 (POLY_PROXY / email login), or 2 "
+                "(POLY_GNOSIS_SAFE / MetaMask). Any other value makes every order "
+                'fail client-side with "Invalid order inputs". Set SIGNATURE_TYPE=0 '
+                "in .env to match your working bot."
             )
         return inst
 
