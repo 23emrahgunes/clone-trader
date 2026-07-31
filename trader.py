@@ -27,6 +27,7 @@ from py_clob_client.clob_types import (
     BalanceAllowanceParams,
     MarketOrderArgs,
     OrderType,
+    PartialCreateOrderOptions,
 )
 from py_clob_client.order_builder.constants import BUY
 
@@ -166,6 +167,28 @@ class PolymarketTrader:
             logger.warning("get_tick_size failed for %s; defaulting to %s", token_id, _DEFAULT_TICK)
             return _DEFAULT_TICK
 
+    async def _get_market_meta(self, token_id: str) -> tuple:
+        """Return (tick_size_str, tick_float, neg_risk) for the market.
+
+        neg_risk is CRITICAL: multi-outcome markets are neg_risk, and submitting
+        with the wrong flag makes the CLOB reject with "Invalid order inputs".
+        """
+        try:
+            tick_str = str(await asyncio.to_thread(self._client.get_tick_size, token_id))
+        except Exception:  # noqa: BLE001
+            logger.warning("get_tick_size failed for %s; defaulting", token_id)
+            tick_str = "0.01"
+        try:
+            neg_risk = bool(await asyncio.to_thread(self._client.get_neg_risk, token_id))
+        except Exception:  # noqa: BLE001
+            logger.warning("get_neg_risk failed for %s; defaulting False", token_id)
+            neg_risk = False
+        try:
+            tick = float(tick_str)
+        except (TypeError, ValueError):
+            tick = _DEFAULT_TICK
+        return tick_str, tick, neg_risk
+
     # -- public API ----------------------------------------------------------
 
     async def execute_1usd_buy(self, token_id: str, target_price: float) -> dict:
@@ -246,10 +269,11 @@ class PolymarketTrader:
                 "required_usdc": allocation,
             }
 
-        # --- Rule 4: FOK market order with price cap for slippage protection ---
-        # Round the cap down to the tick grid so we never exceed the ceiling.
-        tick = await self._get_tick_size(token_id)
-        price_cap = max(tick, (int(max_price / tick)) * tick)
+        # --- Rule 4: FOK market order with price cap + market metadata ---
+        # tick_size AND neg_risk must be passed explicitly; omitting neg_risk on a
+        # multi-outcome market makes the CLOB reject with "Invalid order inputs".
+        tick_str, tick, neg_risk = await self._get_market_meta(token_id)
+        price_cap = max(tick, (round(max_price / tick)) * tick)
         price_cap = round(price_cap, 4)
 
         order_args = MarketOrderArgs(
@@ -259,9 +283,12 @@ class PolymarketTrader:
             price=price_cap,        # protection cap; fill must be at or below this
             order_type=OrderType.FOK,
         )
+        options = PartialCreateOrderOptions(tick_size=tick_str, neg_risk=neg_risk)
+        logger.info("Building order %s: cap=%.4f tick=%s neg_risk=%s",
+                    token_id, price_cap, tick_str, neg_risk)
 
         try:
-            signed = await asyncio.to_thread(self._client.create_market_order, order_args)
+            signed = await asyncio.to_thread(self._client.create_market_order, order_args, options)
             resp = await asyncio.to_thread(self._client.post_order, signed, OrderType.FOK)
         except Exception as exc:  # noqa: BLE001 - report, never crash the tracker loop
             detail = str(exc)
