@@ -116,6 +116,14 @@ class Orchestrator:
         assert self.state.can_execute_live
         logger.info("LIVE copy: 1 USDC buy of %s @ %.4f", trade.token_id, trade.price)
         result = await self.trader.execute_1usd_buy(trade.token_id, trade.price)
+        # Record accepted live fills so they show on the dashboard too.
+        if str(result.get("status")) == "submitted":
+            self.paper.record_buy(
+                trade,
+                mode="live",
+                size=result.get("size"),
+                tx=TelegramBot._extract_tx(result),
+            )
         await self.bot.notify_trade(result)
 
     # -- lifecycle -----------------------------------------------------------

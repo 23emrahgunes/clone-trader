@@ -70,6 +70,28 @@ async def test_compute_pnl():
     print("OK  compute_pnl marks to market (A +0.20, B -0.50, total -0.30)")
 
 
+async def test_live_and_mode_split():
+    led = PaperLedger(_tmp_path())
+    led.record_buy(Trade(token_id="A", price=0.50), mode="paper")        # size 2.0, cost 1.0
+    led.record_buy(Trade(token_id="B", price=0.50), mode="live",
+                   size=3.0, tx="0xLIVE")                                 # size 3.0, cost 1.5
+
+    async def fake_mid(token_ids):
+        return {"A": 0.50, "B": 0.60}
+
+    with patch.object(led, "_fetch_midpoints", side_effect=fake_mid):
+        data = await led.compute_pnl()
+
+    rows = {r["token_id"]: r for r in data["rows"]}
+    assert rows["B"]["mode"] == "live" and rows["B"]["tx"] == "0xLIVE"
+    assert rows["B"]["size"] == 3.0, "live size override respected"
+    modes = data["modes"]
+    assert modes["paper"]["count"] == 1 and modes["live"]["count"] == 1
+    # live: 3.0*0.60 - 1.5 = +0.30
+    assert abs(modes["live"]["pnl"] - 0.30) < 1e-6
+    print("OK  live fills recorded + paper/live mode split")
+
+
 async def test_pnl_missing_price():
     led = PaperLedger(_tmp_path())
     led.record_buy(Trade(token_id="X", price=0.50))
@@ -125,6 +147,7 @@ def _build_app(dash: Dashboard):
 
 async def _run_async():
     await test_compute_pnl()
+    await test_live_and_mode_split()
     await test_pnl_missing_price()
     await test_dashboard_routes()
 

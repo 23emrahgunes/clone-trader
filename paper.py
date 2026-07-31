@@ -31,9 +31,11 @@ class PaperPosition:
     outcome: str
     side: str            # "BUY"
     entry_price: float   # whale's fill price at detection
-    size: float          # shares = round(1 / entry_price, 2)
+    size: float          # shares copied
     cost_usdc: float     # size * entry_price (~1.00)
     whale: str = ""      # which target wallet this copy came from
+    mode: str = "paper"  # "paper" (simulated) or "live" (real order)
+    tx: str = ""         # on-chain tx / order id (live only)
 
 
 class PaperLedger:
@@ -44,10 +46,21 @@ class PaperLedger:
 
     # -- writes --------------------------------------------------------------
 
-    def record_buy(self, trade: Any) -> dict:
-        """Record a simulated 1 USDC BUY from a detected whale trade."""
+    def record_buy(
+        self,
+        trade: Any,
+        *,
+        mode: str = "paper",
+        size: Optional[float] = None,
+        tx: str = "",
+    ) -> dict:
+        """Record a 1 USDC BUY (paper by default, or a real live fill).
+
+        ``size`` overrides the derived share count (live orders may bump it to
+        meet the exchange minimum); ``tx`` is the on-chain hash / order id.
+        """
         price = float(getattr(trade, "price", 0.0) or 0.0)
-        size = round(1.0 / price, 2) if price > 0 else 0.0
+        sz = size if size is not None else (round(1.0 / price, 2) if price > 0 else 0.0)
         pos = PaperPosition(
             ts=int(time.time() * 1000),
             token_id=str(getattr(trade, "token_id", "")),
@@ -55,9 +68,11 @@ class PaperLedger:
             outcome=str(getattr(trade, "outcome", "")),
             side="BUY",
             entry_price=price,
-            size=size,
-            cost_usdc=round(size * price, 4),
+            size=sz,
+            cost_usdc=round(sz * price, 4),
             whale=str(getattr(trade, "proxy_wallet", "")),
+            mode=mode,
+            tx=str(tx or ""),
         )
         try:
             with open(self._path, "a", encoding="utf-8") as fh:
@@ -99,6 +114,7 @@ class PaperLedger:
         total_cost = 0.0
         total_value = 0.0
         by_whale: dict[str, dict] = {}
+        by_mode: dict[str, dict] = {}
         for p in positions:
             cur = prices.get(p.get("token_id", ""))
             size = float(p.get("size", 0.0))
@@ -121,6 +137,14 @@ class PaperLedger:
             if value is not None:
                 agg["value"] += value
 
+            # Per-mode (paper/live) aggregation.
+            m = p.get("mode") or "paper"
+            magg = by_mode.setdefault(m, {"count": 0, "cost": 0.0, "value": 0.0})
+            magg["count"] += 1
+            magg["cost"] += cost
+            if value is not None:
+                magg["value"] += value
+
         whales = []
         for agg in by_whale.values():
             pnl = round(agg["value"] - agg["cost"], 4)
@@ -134,10 +158,22 @@ class PaperLedger:
             })
         whales.sort(key=lambda x: x["pnl"], reverse=True)
 
+        modes = {}
+        for m, agg in by_mode.items():
+            pnl = round(agg["value"] - agg["cost"], 4)
+            modes[m] = {
+                "count": agg["count"],
+                "cost": round(agg["cost"], 4),
+                "value": round(agg["value"], 4),
+                "pnl": pnl,
+                "pnl_pct": round((pnl / agg["cost"] * 100.0) if agg["cost"] else 0.0, 2),
+            }
+
         total_pnl = round(total_value - total_cost, 4)
         return {
             "rows": rows,
             "whales": whales,
+            "modes": modes,  # {"paper": {...}, "live": {...}}
             "totals": {
                 "count": len(positions),
                 "cost": round(total_cost, 4),

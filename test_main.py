@@ -43,7 +43,11 @@ class Trade:
 
 def build_orchestrator():
     """Import main and build an Orchestrator with mocked trader + bot._send."""
+    import os
+    import tempfile
+
     import main as mainmod
+    from paper import PaperLedger
     orch = mainmod.Orchestrator()
 
     # Neutralize real network / Telegram.
@@ -55,6 +59,11 @@ def build_orchestrator():
     orch.bot._send = AsyncMock()
     orch.bot.notify_whale = AsyncMock()
     orch.bot.notify_trade = AsyncMock()
+    # Isolate the paper ledger to a temp file.
+    p = os.path.join(tempfile.gettempdir(), "orch_paper.jsonl")
+    if os.path.exists(p):
+        os.remove(p)
+    orch.paper = PaperLedger(p)
     return orch
 
 
@@ -141,7 +150,11 @@ async def test_decision_live_executes():
     await orch._copy_decision(Trade())
     orch.trader.execute_1usd_buy.assert_awaited_once_with("TOK1", 0.42)
     orch.bot.notify_trade.assert_awaited_once()
-    print("OK  decision: ARMED + live -> executes 1 USDC buy + notifies")
+    # Live fill is recorded to the ledger with mode="live" + tx.
+    rows = orch.paper.load()
+    assert len(rows) == 1 and rows[0]["mode"] == "live" and rows[0]["tx"] == "0xtx"
+    assert rows[0]["size"] == 2.3, "live size from execute result"
+    print("OK  decision: ARMED + live -> executes + records live fill")
 
 
 async def test_set_target_hook_propagates():
