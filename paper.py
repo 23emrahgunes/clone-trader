@@ -81,6 +81,26 @@ class PaperLedger:
             pass
         return asdict(pos)
 
+    def reset(self, scope: str = "paper") -> int:
+        """Clear ledger rows and return how many were removed.
+
+        scope="paper" (default) keeps live fills; "live" keeps paper; "all" wipes
+        everything. Keeping live by default avoids nuking real trade history.
+        """
+        rows = self.load()
+        if scope == "all":
+            kept: list[dict] = []
+        else:
+            drop = "live" if scope == "live" else "paper"
+            kept = [r for r in rows if (r.get("mode") or "paper") != drop]
+        try:
+            with open(self._path, "w", encoding="utf-8") as fh:
+                for r in kept:
+                    fh.write(json.dumps(r, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+        return len(rows) - len(kept)
+
     # -- reads ---------------------------------------------------------------
 
     def load(self) -> list[dict]:

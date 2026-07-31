@@ -161,6 +161,28 @@ async def test_set_target_unauthorized():
     print("OK  /set_target from stranger -> ignored")
 
 
+async def test_reset_command():
+    calls = {}
+
+    async def on_reset(scope):
+        calls["scope"] = scope
+        return 7
+
+    b = make_bot(on_reset=on_reset)
+    # unauthorized ignored
+    await b._cmd_reset(make_update(STRANGER_ID), make_ctx(["all"]))
+    assert "scope" not in calls
+    # admin, default paper
+    upd = make_update(ADMIN_ID)
+    await b._cmd_reset(upd, make_ctx())
+    assert calls["scope"] == "paper"
+    assert "7 kayıt" in upd.message.reply_text.call_args[0][0]
+    # admin, all
+    await b._cmd_reset(make_update(ADMIN_ID), make_ctx(["all"]))
+    assert calls["scope"] == "all"
+    print("OK  /reset: admin-only, paper default, all supported")
+
+
 async def test_status_text_and_balance_provider():
     async def bal():
         return 42.5
@@ -236,6 +258,7 @@ async def _run_async_tests():
     await test_set_target_invalid()
     await test_set_target_unauthorized()
     await test_status_text_and_balance_provider()
+    await test_reset_command()
     await test_notify_dispatch()
 
 

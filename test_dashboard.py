@@ -92,6 +92,25 @@ async def test_live_and_mode_split():
     print("OK  live fills recorded + paper/live mode split")
 
 
+def test_reset_scopes():
+    led = PaperLedger(_tmp_path())
+    led.record_buy(Trade(token_id="A"), mode="paper")
+    led.record_buy(Trade(token_id="B"), mode="paper")
+    led.record_buy(Trade(token_id="C"), mode="live", tx="0x1")
+
+    # default paper: removes paper, keeps live
+    removed = led.reset("paper")
+    assert removed == 2
+    rows = led.load()
+    assert len(rows) == 1 and rows[0]["mode"] == "live"
+
+    # all: wipes remainder
+    led.record_buy(Trade(token_id="D"), mode="paper")
+    removed = led.reset("all")
+    assert removed == 2 and led.load() == []
+    print("OK  reset: paper keeps live, all wipes")
+
+
 async def test_pnl_missing_price():
     led = PaperLedger(_tmp_path())
     led.record_buy(Trade(token_id="X", price=0.50))
@@ -132,9 +151,16 @@ async def test_dashboard_routes():
             j = await r.json()
             assert j["totals"]["count"] == 1
             assert abs(j["rows"][0]["pnl"] - 0.10) < 1e-6  # 2.0*0.55-1.0
+
+        # reset endpoint: token-gated POST
+        r = await app_client.post("/api/reset?scope=all")
+        assert r.status == 401
+        r = await app_client.post("/api/reset?scope=all&key=secret")
+        assert r.status == 200 and (await r.json())["removed"] == 1
+        assert led.load() == []
     finally:
         await app_client.close()
-    print("OK  dashboard: token gate + / and /api/pnl work")
+    print("OK  dashboard: token gate + pnl + reset endpoint")
 
 
 def _build_app(dash: Dashboard):
@@ -142,6 +168,7 @@ def _build_app(dash: Dashboard):
     app = web.Application()
     app.router.add_get("/", dash._index)
     app.router.add_get("/api/pnl", dash._api)
+    app.router.add_post("/api/reset", dash._reset)
     return app
 
 
@@ -154,6 +181,7 @@ async def _run_async():
 
 def main():
     test_record_and_load()
+    test_reset_scopes()
     asyncio.run(_run_async())
     print("\nAll paper/dashboard tests passed.")
 

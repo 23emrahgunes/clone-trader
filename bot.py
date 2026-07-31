@@ -41,6 +41,8 @@ _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 BalanceProvider = Callable[[], Awaitable[Optional[float]]]
 # Called with the full, updated list of target wallets after any change.
 TargetChangeHook = Callable[[list], Awaitable[None]]
+# Called with a scope ("paper"|"live"|"all"); returns number of rows removed.
+ResetHook = Callable[[str], Awaitable[int]]
 
 
 @dataclass
@@ -76,6 +78,7 @@ class TelegramBot:
         state: Optional[BotState] = None,
         balance_provider: Optional[BalanceProvider] = None,
         on_targets_changed: Optional[TargetChangeHook] = None,
+        on_reset: Optional[ResetHook] = None,
         application: Optional[Application] = None,
     ) -> None:
         self.state = state or BotState(
@@ -88,6 +91,7 @@ class TelegramBot:
         self._chat_id = settings.TELEGRAM_CHAT_ID or str(self._admin_id)
         self._balance_provider = balance_provider
         self._on_targets_changed = on_targets_changed
+        self._on_reset = on_reset
 
         # Allow injection of a prebuilt Application (used by unit tests).
         self.app: Application = application or ApplicationBuilder().token(settings.TELEGRAM_TOKEN).build()
@@ -103,6 +107,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler(["add_target", "add"], self._cmd_add_target))
         self.app.add_handler(CommandHandler(["remove_target", "remove", "rm"], self._cmd_remove_target))
         self.app.add_handler(CommandHandler(["targets", "list"], self._cmd_targets))
+        self.app.add_handler(CommandHandler("reset", self._cmd_reset))
 
     def _is_admin(self, update: Update) -> bool:
         """True only for the configured admin user; everyone else is ignored."""
@@ -224,6 +229,27 @@ class TelegramBot:
             return
         lines = "\n".join(f"{i+1}. {w}" for i, w in enumerate(wallets))
         await update.message.reply_text(f"🎯 Takip edilen {len(wallets)} cüzdan:\n{lines}")
+
+    async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Clear the PnL ledger. /reset = paper only; /reset all = everything."""
+        if not self._is_admin(update):
+            return
+        if self._on_reset is None:
+            await update.message.reply_text("Sıfırlama bu kurulumda kapalı.")
+            return
+        arg = (ctx.args[0].strip().lower() if ctx.args else "paper")
+        scope = arg if arg in ("paper", "live", "all") else "paper"
+        try:
+            removed = await self._on_reset(scope)
+        except Exception:  # noqa: BLE001
+            logger.exception("reset hook failed")
+            await update.message.reply_text("⚠️ Sıfırlama başarısız.")
+            return
+        label = {"paper": "paper", "live": "canlı", "all": "TÜM"}[scope]
+        await update.message.reply_text(
+            f"🧹 {label} işlem geçmişi silindi: {removed} kayıt.\n"
+            f"(/reset paper · /reset live · /reset all)"
+        )
 
     # -- notifications (called by tracker/trader callbacks) ------------------
 

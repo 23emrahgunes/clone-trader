@@ -44,6 +44,7 @@ class Orchestrator:
         self.bot = TelegramBot(
             balance_provider=self._get_balance,
             on_targets_changed=self._on_targets_changed,
+            on_reset=self._reset_ledger,
         )
         self.state = self.bot.state
         self.trader = PolymarketTrader()
@@ -69,6 +70,10 @@ class Orchestrator:
     async def _get_balance(self) -> "float | None":
         """Balance provider for /status (best-effort)."""
         return await self.trader.get_usdc_balance()
+
+    async def _reset_ledger(self, scope: str) -> int:
+        """Clear the PnL ledger (Telegram /reset). Returns rows removed."""
+        return self.paper.reset(scope)
 
     # -- copy decision (the filter between detection and execution) ----------
 

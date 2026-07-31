@@ -44,7 +44,13 @@ _PAGE = """<!doctype html>
   .wrap { overflow-x:auto; border:1px solid #30363d; border-radius:10px; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:6px; }
 </style></head><body>
-  <h1><span class="dot"></span>Clone Trader — PnL</h1>
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <h1><span class="dot"></span>Clone Trader — PnL</h1>
+    <div>
+      <button onclick="reset('paper')" style="background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px">🧪 Paper'ı sıfırla</button>
+      <button onclick="reset('all')" style="background:#3d1418;color:#f85149;border:1px solid #5a1e24;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px">Hepsini sil</button>
+    </div>
+  </div>
   <div class="sub" id="meta">yükleniyor…</div>
   <div class="sub" id="modes"></div>
   <div class="cards" id="cards"></div>
@@ -109,6 +115,19 @@ async function refresh(){
       'Son güncelleme: ' + new Date(d.generated_at).toLocaleTimeString('tr-TR') + ' · 10 sn\\'de bir yenilenir';
   } catch(e){ document.getElementById('meta').textContent = 'Bağlantı hatası'; }
 }
+async function reset(scope){
+  const msg = scope==='all' ? 'TÜM işlemler (paper + LIVE) silinecek. Emin misin?'
+                            : 'Paper işlemler silinecek (canlı kayıtlar kalır). Emin misin?';
+  if(!confirm(msg)) return;
+  try {
+    const q = 'scope='+scope+(key?('&key='+encodeURIComponent(key)):'');
+    const r = await fetch('/api/reset?'+q, {method:'POST'});
+    if(r.status===401){ alert('Yetkisiz (key gerekli).'); return; }
+    const j = await r.json();
+    alert((j.removed||0)+' kayıt silindi.');
+    refresh();
+  } catch(e){ alert('Sıfırlama hatası'); }
+}
 refresh(); setInterval(refresh, 10000);
 </script></body></html>"""
 
@@ -150,10 +169,21 @@ class Dashboard:
             return web.json_response({"error": "compute_failed"}, status=500)
         return web.json_response(data)
 
+    async def _reset(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        scope = request.query.get("scope", "paper")
+        if scope not in ("paper", "live", "all"):
+            scope = "paper"
+        removed = self._ledger.reset(scope)
+        logger.info("Ledger reset via dashboard (scope=%s, removed=%d)", scope, removed)
+        return web.json_response({"removed": removed, "scope": scope})
+
     async def start(self) -> None:
         app = web.Application()
         app.router.add_get("/", self._index)
         app.router.add_get("/api/pnl", self._api)
+        app.router.add_post("/api/reset", self._reset)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._host, self._port)
