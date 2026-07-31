@@ -31,8 +31,32 @@ ERC20_ABI = [
 ]
 
 
+# Fallback public Polygon RPCs, tried in order if the configured one is dead.
+_FALLBACK_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.llamarpc.com",
+    "https://1rpc.io/matic",
+    "https://polygon.drpc.org",
+]
+
+
+def _connect() -> Web3:
+    """Return a working Web3 on Polygon, trying the configured RPC then fallbacks."""
+    candidates = [settings.RPC_URL] if settings.RPC_URL else []
+    candidates += _FALLBACK_RPCS
+    for url in candidates:
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 8}))
+            if w3.is_connected() and w3.eth.chain_id == 137:
+                print(f"RPC in use: {url}")
+                return w3
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (skip {url}: {type(exc).__name__})")
+    raise SystemExit("No working Polygon RPC found. Set a valid RPC_URL in .env.")
+
+
 def main() -> None:
-    w3 = Web3(Web3.HTTPProvider(settings.RPC_URL))
+    w3 = _connect()
     eoa = Account.from_key(settings.PRIVATE_KEY).address
     proxy = settings.PROXY_WALLET_ADDRESS
     addrs = {"EOA (PRIVATE_KEY)": eoa}
