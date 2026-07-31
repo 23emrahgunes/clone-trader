@@ -306,9 +306,19 @@ class TelegramBot:
 
         reason = str(result.get("reason", "bilinmeyen"))
         if reason == "slippage_exceeded":
-            detail = (f"Slippage %{result.get('slippage_pct')} > "
-                      f"%{result.get('max_slippage_pct')} "
+            detail = (f"Slippage {result.get('slippage_cents')} > "
+                      f"{result.get('max_slippage_cents')} sent üstü "
                       f"(hedef {result.get('target_price')}, piyasa {result.get('market_price')})")
+        elif reason == "insufficient_balance":
+            bal = result.get("balance_usdc")
+            need = result.get("required_usdc")
+            detail = (f"💰 Cüzdan bakiyesi yetersiz — {bal} USDC var, {need} USDC gerekiyor. "
+                      f"Funder cüzdanına USDC.e yükle.")
+        elif reason == "allowance_missing":
+            detail = ("Cüzdanın CLOB kontratına USDC onayı (allowance) yok. "
+                      "Polymarket'te bir kez manuel işlem yapıp onayı tetikle.")
+        elif reason == "invalid_order_inputs":
+            detail = f"Emir girdileri geçersiz (fiyat/tick/size). Detay: {result.get('detail', '?')}"
         elif reason == "below_min_order":
             detail = f"Minimum emir altında (size {result.get('size')})"
         elif reason == "invalid_target_price":

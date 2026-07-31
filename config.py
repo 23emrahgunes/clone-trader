@@ -130,6 +130,10 @@ class Settings:
     # --- Business rules (see .skills) ---
     FIXED_ALLOCATION_USDC: float = 1.0
     MAX_SLIPPAGE_PCT: float = 3.0
+    # Absolute slippage cap in price units (e.g. 0.03 = 3 cents). For low-priced
+    # markets a percentage is useless (3% of 0.01 = 0.0003), so the effective cap
+    # is target + max(pct-based, this). Set to 0 to disable and use pct only.
+    MAX_SLIPPAGE_CENTS: float = 0.03
     MIN_ORDER_USDC: float = 1.0
 
     @property
@@ -178,6 +182,7 @@ class Settings:
             DASHBOARD_TOKEN=_optional("DASHBOARD_TOKEN"),
             FIXED_ALLOCATION_USDC=_get_float("FIXED_ALLOCATION_USDC", 1.0),
             MAX_SLIPPAGE_PCT=_get_float("MAX_SLIPPAGE_PCT", 3.0),
+            MAX_SLIPPAGE_CENTS=_get_float("MAX_SLIPPAGE_CENTS", 0.03),
             MIN_ORDER_USDC=_get_float("MIN_ORDER_USDC", 1.0),
         )
         if not inst.target_wallet_list:

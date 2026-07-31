@@ -39,6 +39,20 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TICK = 0.01
 
 
+def _classify_order_error(detail: str) -> str:
+    """Map a raw CLOB error string to a human-friendly reason code."""
+    d = (detail or "").lower()
+    if any(k in d for k in ("balance", "insufficient", "not enough", "funds")):
+        return "insufficient_balance"
+    if any(k in d for k in ("allowance", "approve", "not approved")):
+        return "allowance_missing"
+    if any(k in d for k in ("min", "minimum", "too small")):
+        return "below_min_order"
+    if any(k in d for k in ("tick", "price", "invalid", "inputs", "not enough balance / allowance")):
+        return "invalid_order_inputs"
+    return "submission_failed"
+
+
 class ExecutionError(RuntimeError):
     """Raised when an order cannot be built, priced, or accepted."""
 
@@ -180,13 +194,19 @@ class PolymarketTrader:
         size = round(allocation / target_price, 2)
 
         # --- Rule 2: SLIPPAGE PROTECTION (up-front check on the live ask) ---
+        # Effective cap = target + the MORE PERMISSIVE of the percentage and the
+        # absolute cent cap. Low-priced markets (0.01–0.05) need the cent cap
+        # because a percentage of a tiny price is far too tight.
         best_ask = await self._get_best_ask(token_id)
-        max_price = target_price * (1.0 + settings.MAX_SLIPPAGE_PCT / 100.0)
+        pct_room = target_price * settings.MAX_SLIPPAGE_PCT / 100.0
+        cent_room = max(0.0, settings.MAX_SLIPPAGE_CENTS)
+        room = max(pct_room, cent_room)
+        max_price = min(target_price + room, 0.999)  # price can never reach 1.0
         if best_ask > max_price:
-            slippage_pct = (best_ask - target_price) / target_price * 100.0
+            slippage_cents = round(best_ask - target_price, 4)
             logger.warning(
-                "Slippage guard tripped for %s: ask=%.4f target=%.4f (%.2f%% > %.2f%%)",
-                token_id, best_ask, target_price, slippage_pct, settings.MAX_SLIPPAGE_PCT,
+                "Slippage guard tripped for %s: ask=%.4f target=%.4f (Δ%.4f > cap %.4f)",
+                token_id, best_ask, target_price, slippage_cents, room,
             )
             return {
                 "status": "cancelled",
@@ -194,8 +214,8 @@ class PolymarketTrader:
                 "token_id": token_id,
                 "target_price": target_price,
                 "market_price": best_ask,
-                "slippage_pct": round(slippage_pct, 2),
-                "max_slippage_pct": settings.MAX_SLIPPAGE_PCT,
+                "slippage_cents": slippage_cents,
+                "max_slippage_cents": round(room, 4),
             }
 
         # --- Rule 3: MINIMUM ORDER SAFETY -> size * price >= 1.00 USDC ---
@@ -213,8 +233,21 @@ class PolymarketTrader:
                 "min_order_usdc": settings.MIN_ORDER_USDC,
             }
 
+        # --- Balance pre-check: don't even try if the wallet can't cover it ---
+        balance = await self.get_usdc_balance()
+        if balance is not None and balance + 1e-9 < allocation:
+            logger.warning("Insufficient balance for %s: have %.4f need %.2f",
+                           token_id, balance, allocation)
+            return {
+                "status": "cancelled",
+                "reason": "insufficient_balance",
+                "token_id": token_id,
+                "balance_usdc": round(balance, 4),
+                "required_usdc": allocation,
+            }
+
         # --- Rule 4: FOK market order with price cap for slippage protection ---
-        # Round the cap down to the tick grid so we never exceed the 3% ceiling.
+        # Round the cap down to the tick grid so we never exceed the ceiling.
         tick = await self._get_tick_size(token_id)
         price_cap = max(tick, (int(max_price / tick)) * tick)
         price_cap = round(price_cap, 4)
@@ -231,12 +264,15 @@ class PolymarketTrader:
             signed = await asyncio.to_thread(self._client.create_market_order, order_args)
             resp = await asyncio.to_thread(self._client.post_order, signed, OrderType.FOK)
         except Exception as exc:  # noqa: BLE001 - report, never crash the tracker loop
+            detail = str(exc)
             logger.exception("Order submission failed for %s", token_id)
             return {
                 "status": "error",
-                "reason": "submission_failed",
+                "reason": _classify_order_error(detail),
                 "token_id": token_id,
-                "detail": str(exc),
+                "detail": detail,
+                "size": size,
+                "price_cap": price_cap,
             }
 
         accepted = bool(resp.get("success", False)) if isinstance(resp, dict) else True

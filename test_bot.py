@@ -210,14 +210,25 @@ def test_templates():
     assert t.startswith("✅ 1 USDC'lik Clone Trade Atıldı!")
     assert "Fiyat: 0.43" in t and "Size: 2.32" in t and "Tx: 0xabc123" in t
 
-    # cancelled (slippage)
+    # cancelled (slippage, absolute cents)
     c = TelegramBot.format_cancelled(
         {"status": "cancelled", "reason": "slippage_exceeded",
-         "slippage_pct": 20.0, "max_slippage_pct": 3.0,
-         "target_price": 0.5, "market_price": 0.6})
+         "slippage_cents": 0.05, "max_slippage_cents": 0.03,
+         "target_price": 0.01, "market_price": 0.06})
     assert c.startswith("⚠️ İşlem İptal Edildi:")
-    assert "Slippage %20.0 > %3.0" in c
-    print("OK  templates: whale / trade-sent / cancelled")
+    assert "0.05" in c and "0.03 sent" in c
+
+    # cancelled (insufficient balance)
+    c2 = TelegramBot.format_cancelled(
+        {"status": "cancelled", "reason": "insufficient_balance",
+         "balance_usdc": 0.04, "required_usdc": 1.0})
+    assert "bakiyesi yetersiz" in c2 and "0.04" in c2
+
+    # cancelled (invalid order inputs)
+    c3 = TelegramBot.format_cancelled(
+        {"status": "error", "reason": "invalid_order_inputs", "detail": "bad tick"})
+    assert "geçersiz" in c3
+    print("OK  templates: whale / trade-sent / cancelled (cents+balance+inputs)")
 
 
 async def test_notify_dispatch():
