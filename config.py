@@ -112,8 +112,11 @@ class Settings:
     # Only this Telegram user id may command the bot (admin double-lock security).
     TELEGRAM_ADMIN_ID: int = 0
 
-    # --- Copy-trade target ---
+    # --- Copy-trade targets ---
+    # Single wallet (kept for backwards compatibility) …
     TARGET_WALLET: str = ""
+    # … plus an optional comma-separated list of additional wallets to mirror.
+    TARGET_WALLETS: str = ""
 
     # --- Safety switch ---
     # When True the bot only tracks/logs and never sends real orders (paper mode).
@@ -134,10 +137,28 @@ class Settings:
         """True only when all three L2 API credentials are provided in the env."""
         return bool(self.CLOB_API_KEY and self.CLOB_API_SECRET and self.CLOB_API_PASSPHRASE)
 
+    @property
+    def target_wallet_list(self) -> list:
+        """De-duplicated, lower-cased list of every wallet to mirror.
+
+        Merges TARGET_WALLET with the comma/semicolon-separated TARGET_WALLETS.
+        """
+        raw: list = []
+        if self.TARGET_WALLETS:
+            raw.extend(self.TARGET_WALLETS.replace(";", ",").split(","))
+        if self.TARGET_WALLET:
+            raw.append(self.TARGET_WALLET)
+        out: list = []
+        for w in raw:
+            w = w.strip().lower()
+            if w and w not in out:
+                out.append(w)
+        return out
+
     @classmethod
     def load(cls) -> "Settings":
         """Build a validated Settings instance from the current environment."""
-        return cls(
+        inst = cls(
             PRIVATE_KEY=_require("PRIVATE_KEY"),
             PROXY_WALLET_ADDRESS=_require("PROXY_WALLET_ADDRESS"),
             RPC_URL=_require("RPC_URL"),
@@ -150,7 +171,8 @@ class Settings:
             TELEGRAM_TOKEN=_require("TELEGRAM_TOKEN"),
             TELEGRAM_CHAT_ID=_optional("TELEGRAM_CHAT_ID"),
             TELEGRAM_ADMIN_ID=_require_int("TELEGRAM_ADMIN_ID"),
-            TARGET_WALLET=_require("TARGET_WALLET"),
+            TARGET_WALLET=_optional("TARGET_WALLET", "") or "",
+            TARGET_WALLETS=_optional("TARGET_WALLETS", "") or "",
             DRY_RUN=_get_bool("DRY_RUN", True),
             DASHBOARD_PORT=_get_int("DASHBOARD_PORT", 8080),
             DASHBOARD_TOKEN=_optional("DASHBOARD_TOKEN"),
@@ -158,6 +180,12 @@ class Settings:
             MAX_SLIPPAGE_PCT=_get_float("MAX_SLIPPAGE_PCT", 3.0),
             MIN_ORDER_USDC=_get_float("MIN_ORDER_USDC", 1.0),
         )
+        if not inst.target_wallet_list:
+            raise ConfigError(
+                "No copy targets configured. Set TARGET_WALLET or TARGET_WALLETS "
+                "(comma-separated) in .env."
+            )
+        return inst
 
 
 # Import-time singleton. Fails fast at startup if configuration is incomplete.

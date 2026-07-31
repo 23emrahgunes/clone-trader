@@ -33,6 +33,7 @@ class PaperPosition:
     entry_price: float   # whale's fill price at detection
     size: float          # shares = round(1 / entry_price, 2)
     cost_usdc: float     # size * entry_price (~1.00)
+    whale: str = ""      # which target wallet this copy came from
 
 
 class PaperLedger:
@@ -56,6 +57,7 @@ class PaperLedger:
             entry_price=price,
             size=size,
             cost_usdc=round(size * price, 4),
+            whale=str(getattr(trade, "proxy_wallet", "")),
         )
         try:
             with open(self._path, "a", encoding="utf-8") as fh:
@@ -96,6 +98,7 @@ class PaperLedger:
         rows: list[dict] = []
         total_cost = 0.0
         total_value = 0.0
+        by_whale: dict[str, dict] = {}
         for p in positions:
             cur = prices.get(p.get("token_id", ""))
             size = float(p.get("size", 0.0))
@@ -110,15 +113,38 @@ class PaperLedger:
             total_cost += cost
             rows.append({**p, "current_price": cur, "current_value": value, "pnl": pnl})
 
+            # Per-whale aggregation.
+            w = p.get("whale") or "?"
+            agg = by_whale.setdefault(w, {"whale": w, "count": 0, "cost": 0.0, "value": 0.0})
+            agg["count"] += 1
+            agg["cost"] += cost
+            if value is not None:
+                agg["value"] += value
+
+        whales = []
+        for agg in by_whale.values():
+            pnl = round(agg["value"] - agg["cost"], 4)
+            whales.append({
+                "whale": agg["whale"],
+                "count": agg["count"],
+                "cost": round(agg["cost"], 4),
+                "value": round(agg["value"], 4),
+                "pnl": pnl,
+                "pnl_pct": round((pnl / agg["cost"] * 100.0) if agg["cost"] else 0.0, 2),
+            })
+        whales.sort(key=lambda x: x["pnl"], reverse=True)
+
         total_pnl = round(total_value - total_cost, 4)
         return {
             "rows": rows,
+            "whales": whales,
             "totals": {
                 "count": len(positions),
                 "cost": round(total_cost, 4),
                 "value": round(total_value, 4),
                 "pnl": total_pnl,
                 "pnl_pct": round((total_pnl / total_cost * 100.0) if total_cost else 0.0, 2),
+                "whale_count": len(by_whale),
             },
             "generated_at": int(time.time() * 1000),
         }

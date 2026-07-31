@@ -111,20 +111,21 @@ class WhaleTracker:
         self._journal_path = journal_path
         self._dedup_maxlen = dedup_maxlen
 
-        # Copy target is a proxy wallet address; compare case-insensitively.
-        self._target = settings.TARGET_WALLET.lower()
+        # Copy targets are proxy wallet addresses, compared case-insensitively.
+        self._targets: set[str] = set(settings.target_wallet_list)
 
         # Bounded, insertion-ordered set of seen dedup keys.
         self._seen: "OrderedDict[str, None]" = OrderedDict()
-        self._poll_primed = False  # first poll seeds baseline without emitting
+        # Wallets whose baseline history has been seeded (per-wallet priming).
+        self._primed_wallets: set[str] = set()
         self._stopping = asyncio.Event()
 
     # -- lifecycle -----------------------------------------------------------
 
     async def run(self) -> None:
         """Run both sources until stop() is called or cancelled."""
-        logger.info("WhaleTracker starting for target=%s (poll=%.1fs)",
-                    self._target, self._poll_interval_s)
+        logger.info("WhaleTracker starting for %d target(s)=%s (poll=%.1fs)",
+                    len(self._targets), sorted(self._targets), self._poll_interval_s)
         try:
             await asyncio.gather(self._ws_loop(), self._poll_loop())
         except asyncio.CancelledError:
@@ -135,28 +136,53 @@ class WhaleTracker:
         """Signal both loops to exit at the next opportunity."""
         self._stopping.set()
 
-    # -- runtime target -----------------------------------------------------
+    # -- runtime targets ----------------------------------------------------
 
     @property
+    def targets(self) -> list:
+        """Sorted list of wallets currently being mirrored (lower-cased)."""
+        return sorted(self._targets)
+
+    def add_target(self, wallet: str) -> bool:
+        """Start mirroring a wallet at runtime. Returns True if newly added.
+
+        Takes effect immediately (WS has no server-side filter). The new wallet
+        is unprimed, so its existing history is baselined on the next poll rather
+        than replayed as fresh signals.
+        """
+        w = (wallet or "").strip().lower()
+        if not w or w in self._targets:
+            return False
+        self._targets.add(w)
+        self._primed_wallets.discard(w)  # force a fresh baseline
+        logger.info("Tracker target added: %s (now %d)", w, len(self._targets))
+        return True
+
+    def remove_target(self, wallet: str) -> bool:
+        """Stop mirroring a wallet at runtime. Returns True if it was present."""
+        w = (wallet or "").strip().lower()
+        if w not in self._targets:
+            return False
+        self._targets.discard(w)
+        self._primed_wallets.discard(w)
+        logger.info("Tracker target removed: %s (now %d)", w, len(self._targets))
+        return True
+
+    def set_targets(self, wallets) -> None:
+        """Replace the whole target set at runtime (e.g. Telegram /set_target)."""
+        new = {str(w).strip().lower() for w in wallets if str(w).strip()}
+        self._targets = new
+        self._primed_wallets &= new  # keep priming only for retained wallets
+        logger.info("Tracker targets replaced: %s", sorted(self._targets))
+
+    # Backwards-compatible single-wallet accessor.
+    @property
     def target_wallet(self) -> str:
-        """The wallet currently being mirrored (lower-cased)."""
-        return self._target
+        return self.targets[0] if self._targets else ""
 
     @target_wallet.setter
     def target_wallet(self, value: str) -> None:
-        """Switch the tracked wallet at runtime (from Telegram /set_target).
-
-        Takes effect immediately: the WS firehose has no server-side wallet
-        filter, so the next message is matched against the new target. The
-        poller re-primes its baseline so the new wallet's existing history is
-        NOT replayed as fresh copy signals.
-        """
-        new = (value or "").strip().lower()
-        if not new or new == self._target:
-            return
-        logger.info("Tracker target changed: %s -> %s", self._target, new)
-        self._target = new
-        self._poll_primed = False  # re-seed baseline for the new wallet
+        self.set_targets([value] if value else [])
 
     # -- de-dup + emit -------------------------------------------------------
 
@@ -270,9 +296,9 @@ class WhaleTracker:
         return entries
 
     def _parse_ws_entry(self, d: dict) -> Optional[WhaleTrade]:
-        """Build a WhaleTrade from an RTDS activity entry, filtered by target wallet."""
+        """Build a WhaleTrade from an RTDS activity entry, filtered by target wallets."""
         wallet = str(d.get("proxyWallet") or d.get("user") or d.get("userAddress") or "").lower()
-        if not wallet or wallet != self._target:
+        if not wallet or wallet not in self._targets:
             return None
 
         side = str(d.get("side") or "").upper()
@@ -297,63 +323,68 @@ class WhaleTracker:
     # -- source 2: data-api polling backfill ---------------------------------
 
     async def _poll_loop(self) -> None:
-        """Poll /activity for the target wallet as a safety net for missed WS events.
+        """Poll /activity for EACH target wallet as a backfill for missed WS events.
 
-        The WS firehose is the low-latency path; this poll is only a backfill, so
-        it runs at a relaxed interval and backs off exponentially on HTTP 429
-        (rate limit) to stay well within the public API's limits.
+        The WS firehose is the low-latency path; this poll is only a safety net,
+        so it runs at a relaxed interval, spaces per-wallet requests, and backs
+        off exponentially on HTTP 429 to stay within the public API's limits.
         """
         base = self._poll_interval_s
         delay = base
         max_delay = 120.0
+        gap = 1.0  # small pause between per-wallet requests within a cycle
         async with httpx.AsyncClient(timeout=15.0) as client:
             while not self._stopping.is_set():
-                # Rebuilt each iteration so a runtime /set_target is picked up.
-                params = {
-                    "user": self._target,
-                    "type": "TRADE",
-                    "limit": 50,
-                    "sortBy": "TIMESTAMP",
-                    "sortDirection": "DESC",
-                }
-                batch = None
-                try:
-                    resp = await client.get(DATA_API_ACTIVITY_URL, params=params)
-                    resp.raise_for_status()
-                    batch = resp.json()
-                    delay = base  # healthy response -> reset backoff
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 429:
-                        delay = min(max(delay * 2, base * 2), max_delay)
-                        logger.warning("data-api rate-limited (429); backing off to %.0fs", delay)
-                    else:
-                        logger.warning("data-api poll HTTP error: %s", exc)
-                except (httpx.HTTPError, ValueError) as exc:
-                    logger.warning("data-api poll failed: %s", exc)
+                hit_429 = False
+                ok_any = False
+                for wallet in list(self._targets):
+                    if self._stopping.is_set():
+                        break
+                    try:
+                        resp = await client.get(DATA_API_ACTIVITY_URL, params={
+                            "user": wallet, "type": "TRADE", "limit": 50,
+                            "sortBy": "TIMESTAMP", "sortDirection": "DESC",
+                        })
+                        resp.raise_for_status()
+                        batch = resp.json()
+                        ok_any = True
+                        if isinstance(batch, list):
+                            await self._ingest_poll_batch(wallet, batch)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 429:
+                            hit_429 = True
+                            logger.warning("data-api 429 for %s", wallet)
+                        else:
+                            logger.warning("data-api poll HTTP error for %s: %s", wallet, exc)
+                    except (httpx.HTTPError, ValueError) as exc:
+                        logger.warning("data-api poll failed for %s: %s", wallet, exc)
+                    await self._sleep_or_stop(gap)
 
-                if isinstance(batch, list):
-                    await self._ingest_poll_batch(batch)
-
+                if hit_429:
+                    delay = min(max(delay * 2, base * 2), max_delay)
+                    logger.warning("data-api rate-limited; backing off to %.0fs", delay)
+                elif ok_any:
+                    delay = base  # healthy cycle -> reset backoff
                 await self._sleep_or_stop(delay)
 
-    async def _ingest_poll_batch(self, batch: list) -> None:
-        """Emit new trades from a poll batch; the first batch only seeds baseline."""
-        trades = [t for t in (self._parse_poll_entry(e) for e in batch) if t is not None]
+    async def _ingest_poll_batch(self, wallet: str, batch: list) -> None:
+        """Emit new trades for one wallet; the first batch only seeds its baseline."""
+        trades = [t for t in (self._parse_poll_entry(e, wallet) for e in batch) if t is not None]
 
-        if not self._poll_primed:
-            # Startup: record current history as seen so we don't copy old trades.
+        if wallet not in self._primed_wallets:
+            # First sight of this wallet: record current history so we don't copy it.
             for t in trades:
                 self._is_new(t)
-            self._poll_primed = True
-            logger.info("data-api poller primed with %d historical trades", len(trades))
+            self._primed_wallets.add(wallet)
+            logger.info("poller primed %s with %d historical trades", wallet, len(trades))
             return
 
         # API returns newest-first; emit oldest-first so copies keep chronological order.
         for t in reversed(trades):
             await self._emit(t)
 
-    def _parse_poll_entry(self, d: Any) -> Optional[WhaleTrade]:
-        """Build a WhaleTrade from a data-api /activity TRADE entry."""
+    def _parse_poll_entry(self, d: Any, wallet: str = "") -> Optional[WhaleTrade]:
+        """Build a WhaleTrade from a data-api /activity TRADE entry for ``wallet``."""
         if not isinstance(d, dict):
             return None
         if str(d.get("type") or "").upper() not in ("TRADE", ""):
@@ -365,7 +396,7 @@ class WhaleTracker:
             return None
 
         return WhaleTrade(
-            proxy_wallet=str(d.get("proxyWallet") or self._target).lower(),
+            proxy_wallet=str(d.get("proxyWallet") or wallet).lower(),
             side=side,
             token_id=token_id,
             price=_to_float(d.get("price")),

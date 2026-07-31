@@ -43,14 +43,14 @@ class Orchestrator:
         # Bot owns the shared BotState; provide it the balance + target hooks.
         self.bot = TelegramBot(
             balance_provider=self._get_balance,
-            on_set_target=self._on_set_target,
+            on_targets_changed=self._on_targets_changed,
         )
         self.state = self.bot.state
         self.trader = PolymarketTrader()
         # tracker calls _copy_decision for every unique detected trade.
         self.tracker = WhaleTracker(self._copy_decision)
         # Keep tracker and state aligned at startup.
-        self.tracker.target_wallet = self.state.target_wallet
+        self.tracker.set_targets(self.state.target_wallets)
         # Paper ledger + web dashboard for simulated PnL.
         self.paper = PaperLedger()
         self.dashboard = Dashboard(
@@ -61,10 +61,10 @@ class Orchestrator:
 
     # -- hooks injected into the bot -----------------------------------------
 
-    async def _on_set_target(self, address: str) -> None:
-        """Propagate a Telegram /set_target change to the live tracker."""
-        self.tracker.target_wallet = address
-        logger.info("Runtime target switched to %s", address)
+    async def _on_targets_changed(self, wallets: list) -> None:
+        """Propagate a Telegram target-list change to the live tracker."""
+        self.tracker.set_targets(wallets)
+        logger.info("Runtime targets updated: %d wallet(s)", len(wallets))
 
     async def _get_balance(self) -> "float | None":
         """Balance provider for /status (best-effort)."""

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from telegram import Update
@@ -39,16 +39,17 @@ _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # Optional async providers injected by main.py.
 BalanceProvider = Callable[[], Awaitable[Optional[float]]]
-TargetChangeHook = Callable[[str], Awaitable[None]]
+# Called with the full, updated list of target wallets after any change.
+TargetChangeHook = Callable[[list], Awaitable[None]]
 
 
 @dataclass
 class BotState:
     """Shared, mutable runtime state — the authority for the execution gate."""
 
-    armed: bool = False       # ARM/KILL lock; boots False (PAUSED)
-    dry_run: bool = True      # paper switch from settings.DRY_RUN
-    target_wallet: str = ""   # copy target; changeable at runtime
+    armed: bool = False                          # ARM/KILL lock; boots False (PAUSED)
+    dry_run: bool = True                         # paper switch from settings.DRY_RUN
+    target_wallets: list = field(default_factory=list)  # copy targets; runtime-mutable
 
     @property
     def mode(self) -> str:
@@ -74,19 +75,19 @@ class TelegramBot:
         *,
         state: Optional[BotState] = None,
         balance_provider: Optional[BalanceProvider] = None,
-        on_set_target: Optional[TargetChangeHook] = None,
+        on_targets_changed: Optional[TargetChangeHook] = None,
         application: Optional[Application] = None,
     ) -> None:
         self.state = state or BotState(
             armed=False,                       # always boot PAUSED (rule 3)
             dry_run=settings.DRY_RUN,
-            target_wallet=settings.TARGET_WALLET,
+            target_wallets=list(settings.target_wallet_list),
         )
         self._admin_id = settings.TELEGRAM_ADMIN_ID
         # Where notifications go; falls back to the admin's own chat.
         self._chat_id = settings.TELEGRAM_CHAT_ID or str(self._admin_id)
         self._balance_provider = balance_provider
-        self._on_set_target = on_set_target
+        self._on_targets_changed = on_targets_changed
 
         # Allow injection of a prebuilt Application (used by unit tests).
         self.app: Application = application or ApplicationBuilder().token(settings.TELEGRAM_TOKEN).build()
@@ -99,6 +100,9 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("arm", self._cmd_arm))
         self.app.add_handler(CommandHandler(["kill", "pause"], self._cmd_kill))
         self.app.add_handler(CommandHandler("set_target", self._cmd_set_target))
+        self.app.add_handler(CommandHandler(["add_target", "add"], self._cmd_add_target))
+        self.app.add_handler(CommandHandler(["remove_target", "remove", "rm"], self._cmd_remove_target))
+        self.app.add_handler(CommandHandler(["targets", "list"], self._cmd_targets))
 
     def _is_admin(self, update: Update) -> bool:
         """True only for the configured admin user; everyone else is ignored."""
@@ -125,7 +129,7 @@ class TelegramBot:
         live = "CANLI" if not self.state.dry_run else "DRY_RUN (kağıt)"
         await update.message.reply_text(
             f"🟢 ARMED — emir gönderimi AKTİF ({live}).\n"
-            f"Hedef: {self.state.target_wallet}"
+            f"Takip edilen cüzdan: {len(self.state.target_wallets)}"
         )
 
     async def _cmd_kill(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,32 +141,89 @@ class TelegramBot:
             "🔴 PAUSED — emir gönderimi DURDU. Sadece izleme/loglama aktif."
         )
 
+    async def _sync_targets(self) -> None:
+        """Push the current target list to the tracker via the injected hook."""
+        if self._on_targets_changed is not None:
+            try:
+                await self._on_targets_changed(list(self.state.target_wallets))
+            except Exception:  # noqa: BLE001 - hook failure must not break the command
+                logger.exception("on_targets_changed hook failed")
+
+    def _valid_args(self, ctx: ContextTypes.DEFAULT_TYPE) -> tuple:
+        """Split command args into (valid_lower_addresses, invalid_tokens)."""
+        valid, invalid = [], []
+        for a in (ctx.args or []):
+            a = a.strip()
+            (valid if is_valid_address(a) else invalid).append(a.lower() if is_valid_address(a) else a)
+        return valid, invalid
+
     async def _cmd_set_target(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Replace the WHOLE target list with the given address(es)."""
         if not self._is_admin(update):
             return
-        args = ctx.args or []
-        if not args:
-            await update.message.reply_text("Kullanım: /set_target <0x...>")
+        valid, invalid = self._valid_args(ctx)
+        if not valid:
+            await update.message.reply_text("Kullanım: /set_target <0x...> [<0x...> ...]")
             return
+        self.state.target_wallets = list(dict.fromkeys(valid))  # dedupe, keep order
+        await self._sync_targets()
+        msg = "🎯 Hedef listesi güncellendi (%d cüzdan):\n%s" % (
+            len(self.state.target_wallets), "\n".join(self.state.target_wallets))
+        if invalid:
+            msg += "\n⚠️ Geçersiz atlandı: " + ", ".join(invalid)
+        await update.message.reply_text(msg)
 
-        new_target = args[0].strip()
-        if not is_valid_address(new_target):
-            await update.message.reply_text(f"⚠️ Geçersiz cüzdan adresi: {new_target}")
+    async def _cmd_add_target(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Add one or more wallets to the target list."""
+        if not self._is_admin(update):
             return
+        valid, invalid = self._valid_args(ctx)
+        if not valid:
+            await update.message.reply_text("Kullanım: /add_target <0x...> [<0x...> ...]")
+            return
+        added = []
+        for w in valid:
+            if w not in self.state.target_wallets:
+                self.state.target_wallets.append(w)
+                added.append(w)
+        if added:
+            await self._sync_targets()
+        msg = ("➕ Eklendi (%d):\n%s" % (len(added), "\n".join(added))) if added else "Zaten ekli."
+        if invalid:
+            msg += "\n⚠️ Geçersiz atlandı: " + ", ".join(invalid)
+        msg += f"\n\nToplam takip: {len(self.state.target_wallets)}"
+        await update.message.reply_text(msg)
 
-        old = self.state.target_wallet
-        self.state.target_wallet = new_target.lower()
-        logger.info("Target wallet changed: %s -> %s", old, self.state.target_wallet)
+    async def _cmd_remove_target(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Remove one or more wallets from the target list."""
+        if not self._is_admin(update):
+            return
+        valid, _ = self._valid_args(ctx)
+        if not valid:
+            await update.message.reply_text("Kullanım: /remove_target <0x...>")
+            return
+        removed = []
+        for w in valid:
+            if w in self.state.target_wallets:
+                self.state.target_wallets.remove(w)
+                removed.append(w)
+        if removed:
+            await self._sync_targets()
+        msg = ("➖ Çıkarıldı (%d):\n%s" % (len(removed), "\n".join(removed))) if removed \
+            else "Listede yoktu."
+        msg += f"\n\nKalan takip: {len(self.state.target_wallets)}"
+        await update.message.reply_text(msg)
 
-        if self._on_set_target is not None:
-            try:
-                await self._on_set_target(self.state.target_wallet)
-            except Exception:  # noqa: BLE001 - hook failure must not break the command
-                logger.exception("on_set_target hook failed")
-
-        await update.message.reply_text(
-            f"🎯 Hedef cüzdan güncellendi:\n{old}\n→ {self.state.target_wallet}"
-        )
+    async def _cmd_targets(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """List the wallets currently being mirrored."""
+        if not self._is_admin(update):
+            return
+        wallets = self.state.target_wallets
+        if not wallets:
+            await update.message.reply_text("Takip edilen cüzdan yok. /add_target <0x...> ile ekle.")
+            return
+        lines = "\n".join(f"{i+1}. {w}" for i, w in enumerate(wallets))
+        await update.message.reply_text(f"🎯 Takip edilen {len(wallets)} cüzdan:\n{lines}")
 
     # -- notifications (called by tracker/trader callbacks) ------------------
 
@@ -245,9 +306,14 @@ class TelegramBot:
     def _build_status_text(self, balance: Optional[float]) -> str:
         bal = f"{balance:.2f} USDC" if isinstance(balance, (int, float)) else "N/A"
         dry = "AÇIK (kağıt)" if self.state.dry_run else "KAPALI (canlı)"
+        wallets = self.state.target_wallets
+        if len(wallets) <= 1:
+            targets = wallets[0] if wallets else "(yok)"
+        else:
+            targets = f"{len(wallets)} cüzdan (/targets ile listele)"
         return (
             "📊 Clone Trader Durumu\n"
-            f"Hedef Cüzdan : {self.state.target_wallet}\n"
+            f"Hedefler     : {targets}\n"
             f"Durum        : {self.state.mode}\n"
             f"USDC Bakiye  : {bal}\n"
             f"DRY_RUN      : {dry}\n"

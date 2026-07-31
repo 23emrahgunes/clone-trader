@@ -47,9 +47,16 @@ _PAGE = """<!doctype html>
   <h1><span class="dot"></span>Clone Trader — Paper PnL</h1>
   <div class="sub" id="meta">yükleniyor…</div>
   <div class="cards" id="cards"></div>
+  <h2 style="font-size:14px;color:#8b949e;margin:8px 0">Balina bazında</h2>
+  <div class="wrap" style="margin-bottom:24px"><table>
+    <thead><tr>
+      <th>Balina</th><th>İşlem</th><th>Maliyet</th><th>Değer</th><th>PnL</th><th>PnL %</th>
+    </tr></thead><tbody id="whales"></tbody>
+  </table></div>
+  <h2 style="font-size:14px;color:#8b949e;margin:8px 0">İşlemler</h2>
   <div class="wrap"><table>
     <thead><tr>
-      <th>Pazar</th><th>Yön</th><th>Giriş</th><th>Size</th>
+      <th>Pazar</th><th>Balina</th><th>Yön</th><th>Giriş</th><th>Size</th>
       <th>Maliyet</th><th>Güncel</th><th>Değer</th><th>PnL</th>
     </tr></thead><tbody id="rows"></tbody>
   </table></div>
@@ -57,6 +64,7 @@ _PAGE = """<!doctype html>
 const key = new URLSearchParams(location.search).get('key');
 const money = v => (v===null||v===undefined) ? '—' : '$'+Number(v).toFixed(2);
 const cls = v => v>0 ? 'pos' : (v<0 ? 'neg' : '');
+const shortw = w => w ? (w.slice(0,6)+'…'+w.slice(-4)) : '?';
 async function refresh(){
   try {
     const r = await fetch('/api/pnl' + (key ? ('?key='+encodeURIComponent(key)) : ''));
@@ -64,21 +72,29 @@ async function refresh(){
     const d = await r.json();
     const t = d.totals;
     document.getElementById('cards').innerHTML = [
+      ['Balina', t.whale_count||0],
       ['İşlem', t.count],
       ['Maliyet', money(t.cost)],
       ['Güncel Değer', money(t.value)],
       ['PnL', '<span class="'+cls(t.pnl)+'">'+money(t.pnl)+'</span>'],
       ['PnL %', '<span class="'+cls(t.pnl)+'">'+t.pnl_pct.toFixed(2)+'%</span>'],
     ].map(([l,v])=>'<div class="card"><div class="label">'+l+'</div><div class="value">'+v+'</div></div>').join('');
+    document.getElementById('whales').innerHTML = (d.whales||[]).map(w=>
+      '<tr><td title="'+w.whale+'">'+shortw(w.whale)+'</td><td>'+w.count+'</td>'+
+      '<td>'+money(w.cost)+'</td><td>'+money(w.value)+'</td>'+
+      '<td class="'+cls(w.pnl)+'">'+money(w.pnl)+'</td>'+
+      '<td class="'+cls(w.pnl)+'">'+w.pnl_pct.toFixed(2)+'%</td></tr>'
+    ).join('') || '<tr><td colspan="6" class="muted">—</td></tr>';
     document.getElementById('rows').innerHTML = d.rows.slice().reverse().map(p=>{
-      const t = new Date(p.ts).toLocaleString('tr-TR');
-      return '<tr><td>'+(p.market||p.token_id.slice(0,10))+'<div class="muted" style="font-size:11px">'+t+'</div></td>'+
+      const ts = new Date(p.ts).toLocaleString('tr-TR');
+      return '<tr><td>'+(p.market||p.token_id.slice(0,10))+'<div class="muted" style="font-size:11px">'+ts+'</div></td>'+
+        '<td title="'+(p.whale||'')+'">'+shortw(p.whale)+'</td>'+
         '<td>'+p.side+'</td><td>'+Number(p.entry_price).toFixed(3)+'</td><td>'+p.size+'</td>'+
         '<td>'+money(p.cost_usdc)+'</td>'+
         '<td>'+(p.current_price===null?'—':Number(p.current_price).toFixed(3))+'</td>'+
         '<td>'+money(p.current_value)+'</td>'+
         '<td class="'+cls(p.pnl)+'">'+money(p.pnl)+'</td></tr>';
-    }).join('') || '<tr><td colspan="8" class="muted">Henüz paper işlem yok — balina hareketi bekleniyor.</td></tr>';
+    }).join('') || '<tr><td colspan="9" class="muted">Henüz paper işlem yok — balina hareketi bekleniyor.</td></tr>';
     document.getElementById('meta').textContent =
       'Son güncelleme: ' + new Date(d.generated_at).toLocaleTimeString('tr-TR') + ' · 10 sn\\'de bir yenilenir';
   } catch(e){ document.getElementById('meta').textContent = 'Bağlantı hatası'; }

@@ -62,19 +62,24 @@ def build_orchestrator():
 
 def test_tracker_runtime_target():
     tr = WhaleTracker(AsyncMock())
-    start = tr.target_wallet
-    assert start == ("0x" + "a" * 40)
+    assert tr.targets == ["0x" + "a" * 40]
 
-    tr._poll_primed = True
-    tr.target_wallet = "0x" + "B" * 40  # mixed case -> normalized lower
-    assert tr.target_wallet == "0x" + "b" * 40
-    assert tr._poll_primed is False, "changing target must re-prime the poller"
+    # add a second wallet -> tracked, unprimed (fresh baseline)
+    b = "0x" + "b" * 40
+    tr._primed_wallets.add(b)
+    assert tr.add_target("0x" + "B" * 40) is True   # normalized lower
+    assert b in tr.targets and len(tr.targets) == 2
+    assert b not in tr._primed_wallets, "added wallet must be unprimed (re-baselined)"
 
-    # no-op when same
-    tr._poll_primed = True
-    tr.target_wallet = "0x" + "b" * 40
-    assert tr._poll_primed is True, "same target must not reset priming"
-    print("OK  tracker.target_wallet setter switches + re-primes")
+    # remove it
+    assert tr.remove_target(b) is True
+    assert b not in tr.targets
+
+    # replace whole set
+    c = "0x" + "c" * 40
+    tr.set_targets([c])
+    assert tr.targets == [c]
+    print("OK  tracker multi-target: add / remove / set + re-prime")
 
 
 async def test_tracker_ws_uses_new_target():
@@ -141,10 +146,10 @@ async def test_decision_live_executes():
 
 async def test_set_target_hook_propagates():
     orch = build_orchestrator()
-    new = "0x" + "d" * 40
-    await orch._on_set_target(new)
-    assert orch.tracker.target_wallet == new
-    print("OK  /set_target hook propagates to tracker")
+    w1, w2 = "0x" + "d" * 40, "0x" + "e" * 40
+    await orch._on_targets_changed([w1, w2])
+    assert orch.tracker.targets == sorted([w1, w2])
+    print("OK  targets-changed hook propagates full list to tracker")
 
 
 async def test_graceful_shutdown():

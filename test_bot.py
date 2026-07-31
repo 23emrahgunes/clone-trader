@@ -109,35 +109,55 @@ async def test_double_lock_dry_run():
 async def test_set_target_valid():
     captured = {}
 
-    async def hook(addr):
-        captured["addr"] = addr
+    async def hook(wallets):
+        captured["wallets"] = wallets
 
-    b = make_bot(on_set_target=hook)
+    b = make_bot(on_targets_changed=hook)
     upd = make_update(ADMIN_ID)
     new = "0x" + "b" * 40
     await b._cmd_set_target(upd, make_ctx([new]))
-    assert b.state.target_wallet == new.lower()
-    assert captured["addr"] == new.lower(), "on_set_target hook must fire"
+    assert b.state.target_wallets == [new.lower()]
+    assert captured["wallets"] == [new.lower()], "on_targets_changed hook must fire"
     print("OK  /set_target valid -> state updated + hook fired")
+
+
+async def test_set_target_multi():
+    captured = {}
+
+    async def hook(wallets):
+        captured["wallets"] = list(wallets)
+
+    b = make_bot(on_targets_changed=hook)
+    upd = make_update(ADMIN_ID)
+    a, c = "0x" + "a" * 40, "0x" + "c" * 40
+    # replace with two, then add a third, then remove one
+    await b._cmd_set_target(upd, make_ctx([a, c]))
+    assert b.state.target_wallets == [a, c]
+    await b._cmd_add_target(upd, make_ctx(["0x" + "d" * 40]))
+    assert len(b.state.target_wallets) == 3
+    await b._cmd_remove_target(upd, make_ctx([a]))
+    assert a not in b.state.target_wallets and len(b.state.target_wallets) == 2
+    assert captured["wallets"] == b.state.target_wallets, "hook gets full list"
+    print("OK  multi-target: set / add / remove")
 
 
 async def test_set_target_invalid():
     b = make_bot()
-    before = b.state.target_wallet
+    before = list(b.state.target_wallets)
     upd = make_update(ADMIN_ID)
     await b._cmd_set_target(upd, make_ctx(["not-an-address"]))
-    assert b.state.target_wallet == before, "invalid address must be rejected"
+    assert b.state.target_wallets == before, "invalid address must be rejected"
     reply = upd.message.reply_text.call_args[0][0]
-    assert "Geçersiz" in reply
+    assert "Kullanım" in reply
     print("OK  /set_target invalid -> rejected")
 
 
 async def test_set_target_unauthorized():
     b = make_bot()
-    before = b.state.target_wallet
+    before = list(b.state.target_wallets)
     upd = make_update(STRANGER_ID)
     await b._cmd_set_target(upd, make_ctx(["0x" + "c" * 40]))
-    assert b.state.target_wallet == before
+    assert b.state.target_wallets == before
     print("OK  /set_target from stranger -> ignored")
 
 
@@ -212,6 +232,7 @@ async def _run_async_tests():
     await test_arm_and_kill()
     await test_double_lock_dry_run()
     await test_set_target_valid()
+    await test_set_target_multi()
     await test_set_target_invalid()
     await test_set_target_unauthorized()
     await test_status_text_and_balance_provider()
