@@ -131,8 +131,8 @@ class Orchestrator:
     async def run(self) -> None:
         """Start everything and block until a shutdown signal arrives."""
         logger.info(
-            "Starting clone trader | target=%s | DRY_RUN=%s | boot=PAUSED",
-            self.state.target_wallet, self.state.dry_run,
+            "Starting clone trader | %d target(s)=%s | DRY_RUN=%s | boot=PAUSED",
+            len(self.state.target_wallets), self.state.target_wallets, self.state.dry_run,
         )
 
         await self.bot.start()

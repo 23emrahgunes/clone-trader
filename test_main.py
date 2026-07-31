@@ -165,6 +165,28 @@ async def test_set_target_hook_propagates():
     print("OK  targets-changed hook propagates full list to tracker")
 
 
+async def test_run_startup_and_shutdown():
+    """Exercise run()'s full startup path (the log line that referenced state)."""
+    orch = build_orchestrator()
+    orch.bot.start = AsyncMock()
+    orch.bot.stop = AsyncMock()
+    orch.dashboard.start = AsyncMock()
+    orch.dashboard.stop = AsyncMock()
+
+    async def fake_tracker_run():
+        await asyncio.Event().wait()  # block until cancelled
+
+    orch.tracker.run = fake_tracker_run
+    # Trip the shutdown immediately instead of installing real signal handlers.
+    orch._install_signal_handlers = lambda stop: stop.set()
+
+    await asyncio.wait_for(orch.run(), timeout=5)
+    orch.bot.start.assert_awaited_once()
+    orch.dashboard.start.assert_awaited_once()
+    orch.bot.stop.assert_awaited_once()
+    print("OK  run() startup + graceful shutdown (no attr errors)")
+
+
 async def test_graceful_shutdown():
     orch = build_orchestrator()
 
@@ -186,6 +208,7 @@ async def _run_async():
     await test_decision_paused_no_order()
     await test_decision_live_executes()
     await test_set_target_hook_propagates()
+    await test_run_startup_and_shutdown()
     await test_graceful_shutdown()
 
 
