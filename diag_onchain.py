@@ -12,6 +12,8 @@ Read-only: eth_call balanceOf only. No transactions.
 
 from __future__ import annotations
 
+import sys
+
 from eth_account import Account
 from web3 import Web3
 
@@ -62,6 +64,13 @@ def main() -> None:
     addrs = {"EOA (PRIVATE_KEY)": eoa}
     if proxy:
         addrs["PROXY_WALLET_ADDRESS"] = Web3.to_checksum_address(proxy)
+    # Any extra addresses passed on the command line (e.g. your Polymarket UI
+    # deposit address) are checked too, so we can find where the 10 USDC really is.
+    for i, extra in enumerate(sys.argv[1:], 1):
+        try:
+            addrs[f"CLI arg #{i}"] = Web3.to_checksum_address(extra)
+        except Exception:  # noqa: BLE001
+            print(f"  (ignored invalid address arg: {extra!r})")
 
     print("=" * 70)
     print("on-chain USDC diagnostic (Polygon)")
