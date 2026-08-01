@@ -136,7 +136,7 @@ class Settings:
     ORDER_COUNT: int = 5                  # taraf basina alim emri sayisi
     SHARES_PER_ORDER: float = 5.0         # emir basina kontrat (Polymarket BTC 5dk'da min $1 YOK)
     POLL_INTERVAL: float = 0.5            # emir durumu izleme araligi (sn)
-    EXPIRY_CANCEL_SECONDS: int = 30       # kapanisa bu kadar kala cancel-all
+    EXPIRY_CANCEL_SECONDS: int = 15       # kapanisa bu kadar kala cancel-all
     DISCOVERY_RETRY_SECONDS: float = 2.0  # market bulunamazsa bekleme
 
     # --- Guvenlik anahtari ---
@@ -180,7 +180,7 @@ class Settings:
             ORDER_COUNT=_get_int("ORDER_COUNT", 5),
             SHARES_PER_ORDER=_get_float("SHARES_PER_ORDER", 5.0),
             POLL_INTERVAL=_get_float("POLL_INTERVAL", 0.5),
-            EXPIRY_CANCEL_SECONDS=_get_int("EXPIRY_CANCEL_SECONDS", 30),
+            EXPIRY_CANCEL_SECONDS=_get_int("EXPIRY_CANCEL_SECONDS", 15),
             DISCOVERY_RETRY_SECONDS=_get_float("DISCOVERY_RETRY_SECONDS", 2.0),
             DRY_RUN=dry_run,
             DASHBOARD_ENABLED=_get_bool("DASHBOARD_ENABLED", True),

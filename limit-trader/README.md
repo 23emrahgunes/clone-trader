@@ -109,4 +109,4 @@ Alternatif (hızlı): `tmux new -s bot` → `python bot.py` → `Ctrl+b d` ile a
 ## Ayarlanabilir parametreler (.env)
 
 `BUY_PRICE` (0.01) · `SELL_PRICE` (0.02) · `ORDER_COUNT` (5) · `SHARES_PER_ORDER` (5) ·
-`POLL_INTERVAL` (0.5s) · `EXPIRY_CANCEL_SECONDS` (30) · `DRY_RUN` (false)
+`POLL_INTERVAL` (0.5s) · `EXPIRY_CANCEL_SECONDS` (15) · `DRY_RUN` (false)
