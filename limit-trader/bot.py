@@ -359,14 +359,18 @@ class PolyClobClient:
         order_args = OrderArgs(token_id=token_id, price=aligned, size=size, side=side)
         options = PartialCreateOrderOptions(tick_size=tick_str, neg_risk=neg_risk)
         try:
-            # create_and_post_order tek adimda imzalar + gonderir (GTC).
-            resp = await self._call(
-                "create_and_post_order", order_args, options, OrderType.GTC,
-            )
-        except ExecutionError:
-            # Bazi SDK surumlerinde create_and_post_order farkli imza ister; iki-adima dus.
-            signed = await self._call("create_order", order_args, options)
-            resp = await self._call("post_order", signed, OrderType.GTC)
+            try:
+                # create_and_post_order tek adimda imzalar + gonderir (GTC).
+                resp = await self._call(
+                    "create_and_post_order", order_args, options, OrderType.GTC,
+                )
+            except ExecutionError:
+                # Bazi SDK surumlerinde create_and_post_order farkli imza ister; iki-adima dus.
+                signed = await self._call("create_order", order_args, options)
+                resp = await self._call("post_order", signed, OrderType.GTC)
+        except Exception as exc:  # noqa: BLE001 - emir hatasi dongu'yu dusurmesin
+            logger.error("EMIR gonderilemedi %s token=%s: %s", side, token_id[:10], exc)
+            return None
 
         order_id = _extract_order_id(resp)
         accepted = _payload_get(resp, "success", True)
@@ -381,6 +385,17 @@ class PolyClobClient:
         if self.settings.DRY_RUN:
             return {"status": "open", "size_matched": "0"}
         return await self._call("get_order", order_id)
+
+    async def get_open_orders(self) -> list:
+        """Hesabin su an defterde bekleyen tum acik emirlerini dondur (her zaman 200).
+
+        Dolmus emir /data/order/{id}'de 404 verip get_order'u patlatabildigi icin
+        fill tespitinde bu liste birincil, guvenilir kaynaktir.
+        """
+        if self.settings.DRY_RUN:
+            return []
+        result = await self._call("get_open_orders")
+        return result if isinstance(result, list) else []
 
     async def cancel(self, order_id: str) -> Any:
         """Tek bir emri iptal et."""
@@ -610,6 +625,7 @@ class OpenBuy:
     side_label: str          # "YES" / "NO" (log icin)
     size: float
     matched_sold: float = 0.0  # bu emrin satisa cikarilmis dolan miktari
+    seen_open: bool = False    # emir en az bir kez acik emir listesinde goruldu mu
 
 
 class MarketMaker:
@@ -749,18 +765,52 @@ class MarketMaker:
                     f"({self.settings.BUY_PRICE}c x {self.settings.SHARES_PER_ORDER})")
 
     async def _poll_buys(self) -> None:
-        """Acik alimlari izle; dolan miktar icin 2c satis emri koy."""
+        """Acik alimlari izle; dolan miktar icin 2c satis emri koy.
+
+        Birincil sinyal = get_open_orders (her zaman 200 donen liste). Bir alim
+        emrimiz listede yoksa (ve daha once orada gorulduyse) TAM dolmus demektir;
+        listede ama size_matched artmissa kismi dolmustur. Bu, dolmus emrin
+        /data/order'da 404 verip get_order'u patlatma riskini tamamen bypass eder.
+        """
+        if not self._open_buys:
+            return
+
+        # Acik emir haritasi: order_id -> size_matched. AlinamZsa get_order'a dus.
+        open_map: Optional[dict[str, float]] = None
+        try:
+            open_list = await self.client.get_open_orders()
+            open_map = {}
+            for o in open_list:
+                oid = _extract_order_id(o)
+                if oid:
+                    open_map[oid] = matched_size(o)
+        except Exception:  # noqa: BLE001
+            open_map = None
+
         for order_id in list(self._open_buys.keys()):
             buy = self._open_buys[order_id]
-            try:
-                payload = await self.client.get_order(order_id)
-            except Exception:  # noqa: BLE001
-                continue
-            matched = matched_size(payload)
-            unsold = matched - buy.matched_sold
-            fully = is_filled(payload, buy.size)
+            gone = False
+
+            if open_map is not None:
+                if order_id in open_map:
+                    buy.seen_open = True
+                    matched = open_map[order_id]        # hala defterde (kismi dolum olabilir)
+                elif buy.seen_open:
+                    gone = True                          # defterden kalkti -> tam doldu
+                    matched = buy.size
+                else:
+                    continue  # henuz defterde gorunmedi (yayilim gecikmesi); dolmus sayma
+            else:
+                # Liste alinamadi: tekil get_order'a dus (fallback).
+                try:
+                    payload = await self.client.get_order(order_id)
+                except Exception:  # noqa: BLE001
+                    continue
+                matched = matched_size(payload)
+                gone = is_filled(payload, buy.size)
 
             # Dolan (henuz satisa cikmamis) her miktar icin 2c satis koy (min $1 kurali yok).
+            unsold = matched - buy.matched_sold
             if unsold > 0:
                 logger.info("DOLUM %s order=%s dolan=%.2f -> %.2f share 2c satis",
                             buy.side_label, order_id, matched, unsold)
@@ -775,8 +825,8 @@ class MarketMaker:
                     self._event(f"DOLUM {buy.side_label} {unsold:.2f} share -> "
                                 f"{self.settings.SELL_PRICE}c satis kondu")
 
-            if fully:
-                # Alim tamamen doldu ve satisa cikarildi; izlemeden dusur.
+            if gone:
+                # Alim tamamen doldu (veya defterden kalkti); izlemeden dusur.
                 self._open_buys.pop(order_id, None)
 
     async def _poll_sells(self) -> None:
