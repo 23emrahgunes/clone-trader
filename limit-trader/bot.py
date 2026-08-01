@@ -133,8 +133,7 @@ class Settings:
     BUY_PRICE: float = 0.01               # 1c limit alim
     SELL_PRICE: float = 0.02              # 2c limit satis
     ORDER_COUNT: int = 5                  # taraf basina alim emri sayisi
-    SHARES_PER_ORDER: float = 100.0       # emir basina kontrat (100 * 0.01 = 1.00 USDC min)
-    MIN_ORDER_USDC: float = 1.0           # borsa minimum emir buyuklugu
+    SHARES_PER_ORDER: float = 5.0         # emir basina kontrat (Polymarket BTC 5dk'da min $1 YOK)
     POLL_INTERVAL: float = 0.5            # emir durumu izleme araligi (sn)
     EXPIRY_CANCEL_SECONDS: int = 30       # kapanisa bu kadar kala cancel-all
     DISCOVERY_RETRY_SECONDS: float = 2.0  # market bulunamazsa bekleme
@@ -173,8 +172,7 @@ class Settings:
             BUY_PRICE=_get_float("BUY_PRICE", 0.01),
             SELL_PRICE=_get_float("SELL_PRICE", 0.02),
             ORDER_COUNT=_get_int("ORDER_COUNT", 5),
-            SHARES_PER_ORDER=_get_float("SHARES_PER_ORDER", 100.0),
-            MIN_ORDER_USDC=_get_float("MIN_ORDER_USDC", 1.0),
+            SHARES_PER_ORDER=_get_float("SHARES_PER_ORDER", 5.0),
             POLL_INTERVAL=_get_float("POLL_INTERVAL", 0.5),
             EXPIRY_CANCEL_SECONDS=_get_int("EXPIRY_CANCEL_SECONDS", 30),
             DISCOVERY_RETRY_SECONDS=_get_float("DISCOVERY_RETRY_SECONDS", 2.0),
@@ -190,14 +188,6 @@ class Settings:
         if not inst.DRY_RUN and not inst.PROXY_WALLET_ADDRESS:
             raise ConfigError(
                 "Canli modda PROXY_WALLET_ADDRESS (CLOB funder adresi) zorunludur."
-            )
-        # 1c fiyattan emir basina notional en az MIN_ORDER_USDC olmali.
-        notional = inst.BUY_PRICE * inst.SHARES_PER_ORDER
-        if notional + 1e-9 < inst.MIN_ORDER_USDC:
-            raise ConfigError(
-                f"Emir basina notional {notional:.4f} USDC, borsa minimumu "
-                f"{inst.MIN_ORDER_USDC:.2f} USDC altinda. SHARES_PER_ORDER'i artirin "
-                f"(en az {inst.MIN_ORDER_USDC / inst.BUY_PRICE:.0f} share)."
             )
         return inst
 
@@ -703,10 +693,8 @@ class MarketMaker:
             unsold = matched - buy.matched_sold
             fully = is_filled(payload, buy.size)
 
-            # Satisa cikarilmamis dolan miktar min emir buyuklugunu asiyorsa (veya emir
-            # tamamen dolduysa) 2c satis koy.
-            sell_notional = unsold * self.settings.SELL_PRICE
-            if unsold > 0 and (fully or sell_notional + 1e-9 >= self.settings.MIN_ORDER_USDC):
+            # Dolan (henuz satisa cikmamis) her miktar icin 2c satis koy (min $1 kurali yok).
+            if unsold > 0:
                 logger.info("DOLUM %s order=%s dolan=%.2f -> %.2f share 2c satis",
                             buy.side_label, order_id, matched, unsold)
                 sell_id = await self.client.place_limit(

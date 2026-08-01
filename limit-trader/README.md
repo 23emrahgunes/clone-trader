@@ -38,7 +38,7 @@ nano .env     # PRIVATE_KEY, PROXY_WALLET_ADDRESS, SIGNATURE_TYPE=3 doldurun
 | `PRIVATE_KEY` | Polygon cüzdan özel anahtarı (emirleri imzalar) |
 | `PROXY_WALLET_ADDRESS` | CLOB funder adresi (USDC/pozisyonların durduğu proxy) |
 | `SIGNATURE_TYPE` | 0/1/2/3 — proxy+EIP-1271 kurulumunda **3 (POLY_1271)** |
-| `SHARES_PER_ORDER` | Emir başına share (min $1 kuralı: 1¢×100=$1) |
+| `SHARES_PER_ORDER` | Emir başına share (BTC 5dk'da min $1 yok; 5 share gider) |
 
 ### Doğru imza tipini kesinleştir (read-only, emir göndermez)
 
@@ -92,5 +92,5 @@ Alternatif (hızlı): `tmux new -s bot` → `python bot.py` → `Ctrl+b d` ile a
 
 ## Ayarlanabilir parametreler (.env)
 
-`BUY_PRICE` (0.01) · `SELL_PRICE` (0.02) · `ORDER_COUNT` (5) · `SHARES_PER_ORDER` (100) ·
+`BUY_PRICE` (0.01) · `SELL_PRICE` (0.02) · `ORDER_COUNT` (5) · `SHARES_PER_ORDER` (5) ·
 `POLL_INTERVAL` (0.5s) · `EXPIRY_CANCEL_SECONDS` (30) · `DRY_RUN` (false)
