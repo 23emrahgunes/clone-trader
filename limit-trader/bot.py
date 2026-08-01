@@ -35,6 +35,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -141,6 +142,11 @@ class Settings:
     # --- Guvenlik anahtari ---
     DRY_RUN: bool = False                 # True: gercek emir gondermez, sadece simule + loglar
 
+    # --- Web dashboard ---
+    DASHBOARD_ENABLED: bool = True
+    DASHBOARD_PORT: int = 8080
+    DASHBOARD_TOKEN: Optional[str] = None  # ayarliysa /api/state icin ?key=<token> gerekir
+
     @property
     def has_clob_creds(self) -> bool:
         """Uc L2 kimlik bilgisi de verilmisse True."""
@@ -177,6 +183,9 @@ class Settings:
             EXPIRY_CANCEL_SECONDS=_get_int("EXPIRY_CANCEL_SECONDS", 30),
             DISCOVERY_RETRY_SECONDS=_get_float("DISCOVERY_RETRY_SECONDS", 2.0),
             DRY_RUN=dry_run,
+            DASHBOARD_ENABLED=_get_bool("DASHBOARD_ENABLED", True),
+            DASHBOARD_PORT=_get_int("DASHBOARD_PORT", 8080),
+            DASHBOARD_TOKEN=_optional("DASHBOARD_TOKEN"),
         )
         if inst.SIGNATURE_TYPE not in (0, 1, 2, 3):
             raise ConfigError(
@@ -615,6 +624,57 @@ class MarketMaker:
         # order_id -> gonderilen satis miktari
         self._open_sells: dict[str, float] = {}
         self._all_order_ids: set[str] = set()  # cancel-all icin izlenen tum emirler
+        # --- Dashboard durumu ---
+        self._started_at = time.time()
+        self._current_market: Optional[DiscoveredMarket] = None
+        self._events: deque = deque(maxlen=40)
+        self._stats = {"markets": 0, "buys_placed": 0, "sells_placed": 0, "sells_filled": 0}
+
+    def _event(self, msg: str) -> None:
+        """Dashboard olay akisina zaman damgali bir satir ekle (en yeni ustte)."""
+        self._events.appendleft(f"{time.strftime('%H:%M:%S')} {msg}")
+
+    def snapshot(self) -> dict:
+        """Dashboard /api/state icin JSON-serilestirilebilir durum ozeti."""
+        m = self._current_market
+        stc = m.seconds_to_close() if m else None
+        s = self.settings
+        return {
+            "mode": "DRY_RUN" if s.DRY_RUN else "LIVE",
+            "uptime_sec": int(time.time() - self._started_at),
+            "asset": s.ASSET,
+            "timeframe_min": s.TIMEFRAME_MIN,
+            "market": {
+                "slug": m.slug if m else None,
+                "seconds_to_close": round(stc) if stc is not None else None,
+                "window_seconds": s.window_seconds,
+                "yes_token": (m.yes_token[:12] + "...") if m else None,
+                "no_token": (m.no_token[:12] + "...") if m else None,
+            },
+            "open_buys": [
+                {"order_id": b.order_id[:14] + "...", "side": b.side_label,
+                 "price": s.BUY_PRICE, "size": b.size, "matched_sold": b.matched_sold}
+                for b in self._open_buys.values()
+            ],
+            "open_sells": [
+                {"order_id": oid[:14] + "...", "price": s.SELL_PRICE, "size": sz}
+                for oid, sz in self._open_sells.items()
+            ],
+            "stats": {
+                **self._stats,
+                "open_buys": len(self._open_buys),
+                "open_sells": len(self._open_sells),
+                "est_realized_usd": round(
+                    self._stats["sells_filled"] * s.SHARES_PER_ORDER * (s.SELL_PRICE - s.BUY_PRICE), 4
+                ),
+            },
+            "config": {
+                "buy_price": s.BUY_PRICE, "sell_price": s.SELL_PRICE,
+                "order_count": s.ORDER_COUNT, "shares_per_order": s.SHARES_PER_ORDER,
+                "expiry_cancel_seconds": s.EXPIRY_CANCEL_SECONDS,
+            },
+            "events": list(self._events),
+        }
 
     async def run_forever(self) -> None:
         """Sonsuz dongu: guncel marketi bul, isle, kapaninca sonrakine gec."""
@@ -640,12 +700,16 @@ class MarketMaker:
         self._open_buys.clear()
         self._open_sells.clear()
         self._all_order_ids.clear()
+        self._current_market = market
 
         # Kapanisa cok az kalmissa yeni emir koyma.
         if market.seconds_to_close() <= self.settings.EXPIRY_CANCEL_SECONDS:
             logger.info("Market %s kapanisa cok yakin (%.0fsn); atlaniyor",
                         market.slug, market.seconds_to_close())
             return
+
+        self._stats["markets"] += 1
+        self._event(f"MARKET {market.slug} (kapanisa {market.seconds_to_close():.0f}sn)")
 
         # 1) YES ve NO taraflarina ORDER_COUNT adet 1c limit alim.
         await self._place_side_buys(market.yes_token, "YES")
@@ -680,6 +744,9 @@ class MarketMaker:
                     side_label=side_label, size=self.settings.SHARES_PER_ORDER,
                 )
                 self._all_order_ids.add(order_id)
+                self._stats["buys_placed"] += 1
+        self._event(f"{side_label} {self.settings.ORDER_COUNT} alim kondu "
+                    f"({self.settings.BUY_PRICE}c x {self.settings.SHARES_PER_ORDER})")
 
     async def _poll_buys(self) -> None:
         """Acik alimlari izle; dolan miktar icin 2c satis emri koy."""
@@ -704,6 +771,9 @@ class MarketMaker:
                     self._open_sells[sell_id] = unsold
                     self._all_order_ids.add(sell_id)
                     buy.matched_sold += unsold
+                    self._stats["sells_placed"] += 1
+                    self._event(f"DOLUM {buy.side_label} {unsold:.2f} share -> "
+                                f"{self.settings.SELL_PRICE}c satis kondu")
 
             if fully:
                 # Alim tamamen doldu ve satisa cikarildi; izlemeden dusur.
@@ -720,13 +790,168 @@ class MarketMaker:
             if is_filled(payload, size):
                 logger.info("SATIS TAMAM order=%s miktar=%.2f (kar realize)", order_id, size)
                 self._open_sells.pop(order_id, None)
+                self._stats["sells_filled"] += 1
+                self._event(f"SATIS TAMAM {size:.2f} share (kar realize)")
 
     async def _sweep_cancel_all(self) -> None:
         """Tum acik alim + satis emirlerini iptal et ve yerel durumu temizle."""
+        if self._all_order_ids:
+            self._event(f"VADE-SONU cancel-all ({len(self._all_order_ids)} emir)")
         await self.client.cancel_all(list(self._all_order_ids))
         self._open_buys.clear()
         self._open_sells.clear()
         self._all_order_ids.clear()
+
+
+# =====================================================================================
+# D.2 WEB DASHBOARD  (aiohttp -- botla ayni event loop'ta calisir)
+# =====================================================================================
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="tr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC 5dk Market-Maker</title>
+<style>
+:root{--bg:#0b0f14;--card:#141b24;--line:#243040;--fg:#e6edf3;--mut:#8b98a5;
+--grn:#2ea043;--red:#f85149;--blu:#388bfd;--yel:#d29922}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+h1{font-size:18px;margin:0}
+.badge{padding:3px 10px;border-radius:999px;font-weight:700;font-size:12px}
+.live{background:rgba(248,81,73,.15);color:var(--red);border:1px solid var(--red)}
+.dry{background:rgba(56,139,253,.15);color:var(--blu);border:1px solid var(--blu)}
+.mut{color:var(--mut)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);margin:0 0 8px}
+.big{font-size:24px;font-weight:700}
+.mkt{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+.bar{height:8px;background:#0b0f14;border-radius:6px;overflow:hidden;margin-top:10px}
+.bar>i{display:block;height:100%;background:var(--blu)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--mut);font-weight:600}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:640px){.two{grid-template-columns:1fr}}
+.yes{color:var(--grn)}.no{color:var(--red)}
+.log{background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:12px;
+max-height:260px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.log div{padding:2px 0;border-bottom:1px solid #161d27}
+.off{opacity:.5}
+</style></head><body><div class="wrap">
+<header>
+  <h1>BTC 5dk CLOB Market-Maker</h1>
+  <span id="mode" class="badge dry">...</span>
+  <span class="mut" id="uptime"></span>
+  <span class="mut" style="margin-left:auto" id="clock"></span>
+</header>
+
+<div class="mkt">
+  <h2 class="mut" style="margin:0 0 6px;font-size:12px">GUNCEL MARKET</h2>
+  <div id="slug" class="big">-</div>
+  <div class="mut"><span id="stc">-</span> · YES <span id="yes"></span> · NO <span id="no"></span></div>
+  <div class="bar"><i id="bar" style="width:0%"></i></div>
+</div>
+
+<div class="grid">
+  <div class="card"><h2>Market</h2><div class="big" id="s_markets">0</div></div>
+  <div class="card"><h2>Alim kondu</h2><div class="big" id="s_buys">0</div></div>
+  <div class="card"><h2>Acik alim</h2><div class="big" id="s_obuys">0</div></div>
+  <div class="card"><h2>Acik satis</h2><div class="big" id="s_osells">0</div></div>
+  <div class="card"><h2>Satis doldu</h2><div class="big" id="s_filled">0</div></div>
+  <div class="card"><h2>Tahmini kar</h2><div class="big yes" id="s_pnl">$0</div></div>
+</div>
+
+<div class="two">
+  <div class="card"><h2>Acik Alim Emirleri</h2>
+    <table><thead><tr><th>Taraf</th><th>Fiyat</th><th>Miktar</th><th>Order</th></tr></thead>
+    <tbody id="buys"></tbody></table></div>
+  <div class="card"><h2>Acik Satis Emirleri</h2>
+    <table><thead><tr><th>Fiyat</th><th>Miktar</th><th>Order</th></tr></thead>
+    <tbody id="sells"></tbody></table></div>
+</div>
+
+<h2 class="mut" style="font-size:12px;margin:16px 0 8px">OLAY AKISI</h2>
+<div class="log" id="log"></div>
+</div>
+<script>
+const KEY=new URLSearchParams(location.search).get("key");
+const q=id=>document.getElementById(id);
+function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
+  return (h?h+"s ":"")+(m<10?"0":"")+m+"d "+(ss<10?"0":"")+ss+"sn"}
+async function tick(){
+  try{
+    const r=await fetch("/api/state"+(KEY?"?key="+encodeURIComponent(KEY):""));
+    if(!r.ok){q("mode").textContent="ERISIM YOK";return}
+    const d=await r.json();
+    const live=d.mode==="LIVE";
+    q("mode").textContent=d.mode;q("mode").className="badge "+(live?"live":"dry");
+    q("uptime").textContent="calisiyor "+fmtUp(d.uptime_sec);
+    q("clock").textContent=new Date().toLocaleTimeString();
+    const m=d.market;
+    q("slug").textContent=m.slug||"(market araniyor...)";
+    const stc=m.seconds_to_close;
+    q("stc").textContent=stc!=null?("kapanisa "+stc+"sn"):"-";
+    q("yes").textContent=m.yes_token||"";q("no").textContent=m.no_token||"";
+    const pct=(stc!=null&&m.window_seconds)?Math.max(0,Math.min(100,100*stc/m.window_seconds)):0;
+    q("bar").style.width=pct+"%";
+    q("bar").style.background=stc!=null&&stc<=d.config.expiry_cancel_seconds?"var(--red)":"var(--blu)";
+    q("s_markets").textContent=d.stats.markets;
+    q("s_buys").textContent=d.stats.buys_placed;
+    q("s_obuys").textContent=d.stats.open_buys;
+    q("s_osells").textContent=d.stats.open_sells;
+    q("s_filled").textContent=d.stats.sells_filled;
+    q("s_pnl").textContent="$"+d.stats.est_realized_usd.toFixed(2);
+    q("buys").innerHTML=d.open_buys.map(b=>`<tr><td class="${b.side==='YES'?'yes':'no'}">${b.side}</td>`
+      +`<td>${b.price}c</td><td>${b.size}</td><td class="mut">${b.order_id}</td></tr>`).join("")
+      ||`<tr><td colspan=4 class="mut">yok</td></tr>`;
+    q("sells").innerHTML=d.open_sells.map(s=>`<tr><td>${s.price}c</td><td>${s.size}</td>`
+      +`<td class="mut">${s.order_id}</td></tr>`).join("")
+      ||`<tr><td colspan=3 class="mut">yok</td></tr>`;
+    q("log").innerHTML=d.events.map(e=>`<div>${e}</div>`).join("")||`<div class="mut">...</div>`;
+  }catch(e){q("mode").textContent="BAGLANTI YOK"}
+}
+tick();setInterval(tick,1000);
+</script></body></html>"""
+
+
+async def run_dashboard(maker: "MarketMaker", settings: Settings) -> None:
+    """Botla ayni event loop'ta hafif bir durum panosu sunar (aiohttp)."""
+    try:
+        from aiohttp import web
+    except Exception:  # noqa: BLE001
+        logger.warning("aiohttp yok; dashboard devre disi. 'pip install aiohttp' ile kurun.")
+        return
+
+    def _authorized(request: Any) -> bool:
+        if not settings.DASHBOARD_TOKEN:
+            return True
+        return request.query.get("key") == settings.DASHBOARD_TOKEN
+
+    async def index(request: Any) -> Any:
+        return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+    async def state(request: Any) -> Any:
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response(maker.snapshot())
+
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_get("/api/state", state)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", settings.DASHBOARD_PORT)
+    try:
+        await site.start()
+        logger.info("Dashboard hazir: http://0.0.0.0:%d%s", settings.DASHBOARD_PORT,
+                    " (?key=...)" if settings.DASHBOARD_TOKEN else "")
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
 
 
 # =====================================================================================
@@ -762,12 +987,18 @@ def _print_config_check(settings: Settings) -> None:
     print(f"  PRIVATE_KEY          : {'*** set ***' if settings.PRIVATE_KEY else 'MISSING'}")
     print(f"  L2 API creds         : {'*** set ***' if settings.has_clob_creds else '(turetilecek)'}")
     print(f"  py-clob-client SDK   : {'kurulu' if _SDK_AVAILABLE else 'KURULU DEGIL'}")
+    dash = f"acik (port {settings.DASHBOARD_PORT}{', token' if settings.DASHBOARD_TOKEN else ''})" \
+        if settings.DASHBOARD_ENABLED else "kapali"
+    print(f"  Web dashboard        : {dash}")
 
 
 async def _amain(settings: Settings) -> None:
     client = PolyClobClient(settings)
     discovery = MarketDiscovery(settings)
     maker = MarketMaker(settings, client, discovery)
+    # Dashboard'u arka planda baslat (bot ile ayni event loop; hata verse bot dusmez).
+    if settings.DASHBOARD_ENABLED:
+        asyncio.create_task(run_dashboard(maker, settings))
     try:
         await maker.run_forever()
     except (KeyboardInterrupt, asyncio.CancelledError):

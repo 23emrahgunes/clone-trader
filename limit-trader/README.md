@@ -62,6 +62,22 @@ Loglarda güncel `btc-updown-5m-*` slug'ı, YES/NO token'ları ve `seconds_to_cl
 python bot.py            # .env içinde DRY_RUN=false
 ```
 
+## Web arayüzü (dashboard)
+
+Bot çalışırken tarayıcıdan izleme panosu açılır (canlı market + geri sayım, açık alım/satış
+emirleri, istatistikler, olay akışı). Varsayılan port **8080**.
+
+**Önerilen — SSH tüneli (firewall değişikliği gerekmez):** kendi bilgisayarından
+```bash
+ssh -L 8080:localhost:8080 KULLANICI@VPS_IP
+```
+sonra tarayıcıda: **http://localhost:8080**
+
+**Alternatif — public erişim:** `.env`'de `DASHBOARD_TOKEN=<gizli>` koy, VPS firewall'ında 8080'i aç,
+tarayıcıda: `http://VPS_IP:8080/?key=<gizli>`. (Token'sız public açmayın.)
+
+Kapatmak için `.env`: `DASHBOARD_ENABLED=false`.
+
 ## VPS'te sürekli çalıştırma (systemd)
 
 `/etc/systemd/system/limit-trader.service`:
