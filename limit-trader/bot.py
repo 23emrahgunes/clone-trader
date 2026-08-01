@@ -144,7 +144,7 @@ class Settings:
 
     # --- Web dashboard ---
     DASHBOARD_ENABLED: bool = True
-    DASHBOARD_PORT: int = 8080
+    DASHBOARD_PORT: int = 8090            # clone-trader 8080 kullaniyor; cakismamak icin 8090
     DASHBOARD_TOKEN: Optional[str] = None  # ayarliysa /api/state icin ?key=<token> gerekir
 
     @property
@@ -184,7 +184,7 @@ class Settings:
             DISCOVERY_RETRY_SECONDS=_get_float("DISCOVERY_RETRY_SECONDS", 2.0),
             DRY_RUN=dry_run,
             DASHBOARD_ENABLED=_get_bool("DASHBOARD_ENABLED", True),
-            DASHBOARD_PORT=_get_int("DASHBOARD_PORT", 8080),
+            DASHBOARD_PORT=_get_int("DASHBOARD_PORT", 8090),
             DASHBOARD_TOKEN=_optional("DASHBOARD_TOKEN"),
         )
         if inst.SIGNATURE_TYPE not in (0, 1, 2, 3):
