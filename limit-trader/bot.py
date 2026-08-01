@@ -739,6 +739,10 @@ def _configure_logging() -> None:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Gurultulu HTTP kutuphane loglarini sustur; sadece botun kendi INFO mesajlari kalsin
+    # (EMIR / DOLUM / SATIS / MARKET BULUNDU / VADE-SONU). bot.log okunur kalir ve sismez.
+    for noisy in ("httpx", "httpcore", "urllib3", "web3", "py_clob_client_v2"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def _print_config_check(settings: Settings) -> None:
