@@ -1,0 +1,9 @@
+# Polymarket BTC 5m CLOB market-maker botu bagimliliklari
+# NOT: py-clob-client-v2 (fork) kullaniliyor -- kullanicinin canli edge botlariyla ayni yigin.
+# Bu fork SignatureTypeV2.POLY_1271=3'u destekler (resmi py-clob-client yalnizca 0/1/2 kabul eder).
+# Kurulum yoksa pyton-polymarket/.venv icindeki surumden de alinabilir.
+py-clob-client-v2
+web3>=6.15.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+eth-account>=0.11.0
