@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -26,6 +27,12 @@ from dotenv import load_dotenv
 from py_clob_client_v2 import ApiCreds, ClobClient
 
 load_dotenv()
+
+# nohup ile dosyaya yazarken print ciktisi tamponlanmasin -> arb.log aninda dolsun.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 GAMMA = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
