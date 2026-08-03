@@ -77,6 +77,13 @@ def _i(name: str, d: int) -> int:
         return d
 
 
+def _b(name: str, d: bool) -> bool:
+    v = os.getenv(name)
+    if not v or not v.strip():
+        return d
+    return v.strip().lower() in ("1", "true", "yes", "on", "y", "evet")
+
+
 @dataclass(frozen=True)
 class Settings:
     PRIVATE_KEY: str = field(repr=False)
@@ -106,6 +113,7 @@ class Settings:
     DASHBOARD_PORT: int = 8091       # limit-trader 8090, clone-trader 8080 -> 8091
     DASHBOARD_TOKEN: Optional[str] = None
     LEDGER_FILE: str = "signal_trades.jsonl"
+    REVERSE: bool = False            # True: sinyalin TERSI tarafi al (mean-reversion tezi testi)
 
     @property
     def has_creds(self) -> bool:
@@ -137,6 +145,8 @@ class Settings:
             ORDER_SHARES=_f("ORDER_SHARES", 5.0),
             DASHBOARD_PORT=_i("DASHBOARD_PORT", 8091),
             DASHBOARD_TOKEN=os.getenv("DASHBOARD_TOKEN"),
+            LEDGER_FILE=_req("LEDGER_FILE", "signal_trades.jsonl"),
+            REVERSE=_b("REVERSE", False),
         )
         if s.SIGNATURE_TYPE not in (0, 1, 2, 3):
             raise RuntimeError("SIGNATURE_TYPE 0/1/2/3 olmali (v2 fork; POLY_1271=3).")
@@ -468,7 +478,10 @@ class Strategy:
             self.signal = f"{best_side} (EV={best_ev:+.3f})" if best_ev >= self.s.EDGE_MARGIN else \
                           f"bekle (en iyi EV={best_ev:+.3f})"
             if can_enter and best_ev >= self.s.EDGE_MARGIN:
-                await self._enter(best_side)
+                side = best_side
+                if self.s.REVERSE:
+                    side = "DOWN" if best_side == "UP" else "UP"  # sinyalin TERSI
+                await self._enter(side)
 
     async def _enter(self, side: str) -> None:
         m = self.market
@@ -531,7 +544,8 @@ class Strategy:
         m = self.market
         pt = self.stats["paper_trades"]; lt = self.stats["live_trades"]
         return {
-            "mode": "LIVE ARMED" if self.live_armed else "PAPER",
+            "mode": ("LIVE ARMED" if self.live_armed else "PAPER") + (" · TERS" if self.s.REVERSE else ""),
+            "reverse": self.s.REVERSE,
             "uptime": int(time.time() - self.started),
             "market_name": (m["name"] if m else None),
             "slug": (m["slug"] if m else None),
@@ -776,7 +790,8 @@ def main() -> None:
         print(f"OK · sig={s.SIGNATURE_TYPE} · dash port={s.DASHBOARD_PORT} · SDK={'kurulu' if _SDK else 'YOK'} "
               f"· creds={'set' if s.has_creds else 'turetilecek'} · EDGE_MARGIN={s.EDGE_MARGIN}")
         return
-    logger.info("Signal-Trader basladi (PAPER). Canliya gecis dashboard'dan ARM ile.")
+    logger.info("Signal-Trader basladi (PAPER%s). Canliya gecis dashboard'dan ARM ile.",
+                " · TERS/REVERSE" if s.REVERSE else "")
     try:
         asyncio.run(amain(s))
     except KeyboardInterrupt:
