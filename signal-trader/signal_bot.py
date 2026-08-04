@@ -106,6 +106,7 @@ class Settings:
     MIN_TICKS: int = 20              # oynaklik icin min tick
     MIN_SEC_TO_CLOSE: float = 20.0   # bu kadar kaladan az ise girme
     MIN_ELAPSED_SEC: float = 15.0    # pencere basindan bu kadar gecmeden girme
+    MAX_ABS_D: float = 0.0           # |d| bunu asarsa girme (0=limit yok). Reverse icin ~25 onerilir
     ORDER_SHARES: float = 5.0        # emir/pozisyon boyutu (share)
     FEE_BPS_DEFAULT: float = 1000.0  # fee alinamAzsa varsayilan (bps)
     FEE_EXP_DEFAULT: float = 1.0
@@ -142,6 +143,7 @@ class Settings:
             MIN_TICKS=_i("MIN_TICKS", 20),
             MIN_SEC_TO_CLOSE=_f("MIN_SEC_TO_CLOSE", 20.0),
             MIN_ELAPSED_SEC=_f("MIN_ELAPSED_SEC", 15.0),
+            MAX_ABS_D=_f("MAX_ABS_D", 0.0),
             ORDER_SHARES=_f("ORDER_SHARES", 5.0),
             DASHBOARD_PORT=_i("DASHBOARD_PORT", 8091),
             DASHBOARD_TOKEN=os.getenv("DASHBOARD_TOKEN"),
@@ -471,8 +473,9 @@ class Strategy:
             self.ev_up = self.p_up - self.yes_ask - yf
             self.ev_down = (1 - self.p_up) - self.no_ask - nf
             # 5) giris kosullari
+            d_ok = (self.s.MAX_ABS_D <= 0) or (abs(d) <= self.s.MAX_ABS_D)
             can_enter = (stc >= self.s.MIN_SEC_TO_CLOSE and elapsed >= self.s.MIN_ELAPSED_SEC
-                         and self.window not in self.open_pos)
+                         and d_ok and self.window not in self.open_pos)
             best_side = "UP" if self.ev_up >= self.ev_down else "DOWN"
             best_ev = max(self.ev_up, self.ev_down)
             self.signal = f"{best_side} (EV={best_ev:+.3f})" if best_ev >= self.s.EDGE_MARGIN else \

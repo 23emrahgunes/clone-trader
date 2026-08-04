@@ -34,10 +34,10 @@ for f in signal_trades.jsonl reverse_trades.jsonl signal.log reverse.log; do
 done
 
 # --- ikisini de sifirdan baslat ---
-echo "-- NORMAL baslatiliyor (port 8091) --"
+echo "-- NORMAL baslatiliyor (port 8091, kontrol) --"
 nohup python -u signal_bot.py > signal.log 2>&1 &
-echo "-- TERS baslatiliyor (port 8092) --"
-REVERSE=true DASHBOARD_PORT=8092 LEDGER_FILE=reverse_trades.jsonl nohup python -u signal_bot.py > reverse.log 2>&1 &
+echo "-- TERS + |d|<25 filtresi baslatiliyor (port 8092, rafine) --"
+REVERSE=true MAX_ABS_D=25 DASHBOARD_PORT=8092 LEDGER_FILE=reverse_trades.jsonl nohup python -u signal_bot.py > reverse.log 2>&1 &
 sleep 3
 
 # --- durum ---
