@@ -336,6 +336,9 @@ class Clob:
         self._c = await asyncio.to_thread(build)
 
     async def buy_fok(self, token: str, price: float, shares: float) -> Optional[str]:
+        if self._c is None:
+            logger.error("CLOB baglanmadi; canli emir gonderilemiyor (gecerli PRIVATE_KEY gerekir).")
+            return None
         def go():
             tick = str(self._c.get_tick_size(token))
             neg = bool(self._c.get_neg_risk(token))
@@ -797,7 +800,12 @@ async def strategy_loop(strat: Strategy, stop: asyncio.Event) -> None:
 
 async def amain(s: Settings) -> None:
     clob = Clob(s)
-    await clob.connect()
+    try:
+        await clob.connect()   # sadece canli ARM icin gerekli; paper order book public'ten okur
+        logger.info("CLOB baglandi (canli ARM hazir).")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CLOB baglanamadi: %s -> sadece PAPER calisir "
+                       "(canli ARM icin gecerli PRIVATE_KEY gerekir).", str(exc)[:120])
     strat = Strategy(s, clob)
     stop = asyncio.Event()
     await asyncio.gather(strategy_loop(strat, stop), dashboard(strat, stop))
@@ -819,6 +827,49 @@ def _check(s: Settings) -> None:
               f"P(>= {T}F)={p}  {'(zirve gecti)' if ens and ens['peak_passed'] else ''}")
 
 
+def _scan_diag(s: Settings) -> None:
+    """Teshis: weather-anahtar + sehir eslesen marketleri HAM yapisiyla dok."""
+    kws = ("temperature", "temp", "°", "degrees", "warm", "hottest", "high", "weather")
+    scanned = 0
+    wx = 0
+    offset = 0
+    page = 500
+    safety = 0
+    print("Weather-market TESHIS taramasi (ham yapi) ...")
+    while True:
+        try:
+            r = requests.get(f"{s.GAMMA_HOST}/markets",
+                             params={"active": "true", "closed": "false", "limit": page, "offset": offset},
+                             timeout=25)
+            if r.status_code != 200:
+                print(f"  Gamma status {r.status_code} (offset={offset}), duruyor")
+                break
+            data = r.json()
+        except Exception as exc:
+            print(f"  hata: {exc}")
+            break
+        if not isinstance(data, list) or not data:
+            break
+        for m in data:
+            scanned += 1
+            q = str(m.get("question") or m.get("title") or "")
+            ql = q.lower()
+            city = _match_city(q)
+            if city and any(k in ql for k in kws):
+                wx += 1
+                toks = _list(m.get("clobTokenIds"))
+                outs = _list(m.get("outcomes"))
+                T = _parse_threshold(q)
+                print(f"  [{CITIES[city]['name']:<13}] tok={len(toks)} T={T} out={outs}  | {q[:82]}")
+        offset += len(data)
+        safety += 1
+        if safety > 60:
+            break
+    print(f"\ntaranan={scanned}  weather+sehir eslesme={wx}")
+    print("Yorum: tok=2 -> binary (mevcut parser calisir). tok>2 -> cok-sonuclu (parser guncellenmeli).")
+    print("       Hic eslesme yoksa -> weather marketleri offset capinin otesinde; farkli sorgu gerekir.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Polymarket weather botu")
     ap.add_argument("--check", action="store_true", help="config + veri baglaci self-test")
@@ -832,8 +883,7 @@ def main() -> None:
         _check(s)
         return
     if args.scan:
-        for m in discover_weather_markets(s):
-            print(f"  [{CITIES[m.city]['name']:<14}] >= {m.threshold:.0f}F  {m.question}  ({m.slug})")
+        _scan_diag(s)
         return
     logger.info("Weather-Bot basladi (PAPER). Canliya gecis dashboard'dan ARM ile.")
     try:
