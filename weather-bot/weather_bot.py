@@ -1,21 +1,20 @@
-"""Polymarket Weather Botu -- "zaten oldu" (near-resolution) edge, 5 ABD sehri.
+"""Polymarket Weather Botu -- gunluk-high BUCKET marketleri, "zaten oldu" edge.
 
-FIKIR: Market "Bugun {sehir} high >= T F mi?" diye soruyor. Gunun max sicakligi
-ogleden sonra fiilen kilitlenir; ama market bunu gec fiyatlar. Gozlenen high (METAR,
-istasyonun gece-yarisindan-beri max'i) esigi zaten gectiyse "EVET" KESIN -> ucuz YES'i
-al. Zirve gecti ve gozlenen < esik ise "HAYIR" kesin -> ucuz NO'yu al. Aradaki
-belirsizligi Open-Meteo ensemble (kalan gun) verir.
+YAPI (gercek): her sehir/gun bir EVENT; icinde ~11 BUCKET marketi (Yes/No):
+  '77F or below', '78-79F', '80-81F', ..., '94-95F', '96F or higher'.
+Sorun: gunun high'i hangi bucket'a duser?
 
-  P(YES) = (member_final_max >= T olan ensemble uye orani), final = max(H_obs, kalan_max)
-  EV_yes = P(YES) - YES_ask - fee ;  EV_no = (1-P(YES)) - NO_ask - fee
-  |EV| >= EDGE_MARGIN -> sinyal. Varsayilan PAPER; dashboard'dan tek-tik ARM ile canli.
+EDGE ("zaten oldu"): gunun max'i ogleden sonra gozlemle kilitlenir; market gec
+fiyatlar. Her bucket icin gercek olasilik:
+  P(bucket) = final_high in [lo,hi] olan ensemble uye orani,  final=max(H_obs, kalan_gun_max)
+Gun ilerledikce H_obs altindaki bucket'lar imkansizlasir (P=0), H_obs'un bucket'i
+near-certain (P->1). Market bunu gec fiyatlarsa ucuz kesin tarafi al.
+  EV_yes = P(bucket) - YES_fiyat - fee ; EV_no = (1-P) - NO_fiyat - fee
+  en iyi EV >= EDGE_MARGIN -> sinyal. Varsayilan PAPER; dashboard'dan tek-tik ARM.
 
-Veri (hepsi UCRETSIZ, key gerekmez):
-  - Gozlem: aviationweather METAR (resolution istasyonuyla birebir)
-  - Ensemble: Open-Meteo Ensemble API (ECMWF/GFS/ICON uyeleri)
-Resolution: NWS Daily Climate Report (CLI), gunluk HIGH, yerel gece yarisindan, F.
-
-READ/WRITE: canli ARM edilmedikce hicbir gercek emir gitmez.
+Veri (UCRETSIZ, key yok): METAR gozlem (resolution istasyonu) + Open-Meteo ensemble.
+Kesif: Gamma /events?slug=highest-temperature-in-{sehir}-on-{ay}-{gun}-{yil}.
+Resolution: NWS CLI gunluk HIGH (F). Paper cozumlemesi Open-Meteo archive.
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -46,30 +45,26 @@ except Exception:
 logger = logging.getLogger("weather-bot")
 
 # =====================================================================================
-# Sehir / istasyon haritasi (resolution = NWS CLI, bu istasyonlar)
+# Sehir / istasyon / slug haritasi (resolution = NWS CLI, bu istasyonlar)
 # =====================================================================================
 
 CITIES: dict[str, dict] = {
     "nyc":     {"name": "New York City", "station": "KNYC", "lat": 40.78, "lon": -73.97,
-                "tz": "America/New_York",    "aliases": ["new york city", "new york", "nyc"]},
+                "tz": "America/New_York",    "slugs": ["nyc", "new-york-city", "new-york"]},
     "chicago": {"name": "Chicago",       "station": "KMDW", "lat": 41.79, "lon": -87.75,
-                "tz": "America/Chicago",     "aliases": ["chicago"]},
+                "tz": "America/Chicago",     "slugs": ["chicago"]},
     "la":      {"name": "Los Angeles",   "station": "KLAX", "lat": 33.94, "lon": -118.41,
-                "tz": "America/Los_Angeles", "aliases": ["los angeles", "la"]},
+                "tz": "America/Los_Angeles", "slugs": ["la", "los-angeles"]},
     "miami":   {"name": "Miami",         "station": "KMIA", "lat": 25.79, "lon": -80.29,
-                "tz": "America/New_York",    "aliases": ["miami"]},
+                "tz": "America/New_York",    "slugs": ["miami"]},
     "sf":      {"name": "San Francisco", "station": "KSFO", "lat": 37.62, "lon": -122.37,
-                "tz": "America/Los_Angeles", "aliases": ["san francisco", "sf"]},
+                "tz": "America/Los_Angeles", "slugs": ["sf", "san-francisco"]},
 }
-
-
-def _match_city(text: str) -> Optional[str]:
-    t = text.lower()
-    for key, c in CITIES.items():
-        for a in c["aliases"]:
-            if a in t:
-                return key
-    return None
+SLUG_TEMPLATES = [
+    "highest-temperature-in-{n}-on-{d}",
+    "high-temperature-in-{n}-on-{d}",
+    "what-will-the-high-temperature-be-in-{n}-on-{d}",
+]
 
 
 # =====================================================================================
@@ -101,13 +96,6 @@ def _i(name: str, d: int) -> int:
         return d
 
 
-def _b(name: str, d: bool) -> bool:
-    v = os.getenv(name)
-    if not v or not v.strip():
-        return d
-    return v.strip().lower() in ("1", "true", "yes", "on", "y", "evet")
-
-
 @dataclass(frozen=True)
 class Settings:
     PRIVATE_KEY: str = field(repr=False)
@@ -120,12 +108,11 @@ class Settings:
     CLOB_API_SECRET: Optional[str] = field(default=None, repr=False)
     CLOB_API_PASSPHRASE: Optional[str] = field(default=None, repr=False)
 
-    CITIES: str = "nyc,chicago,la,miami,sf"     # hangi sehirler
-    EDGE_MARGIN: float = 0.05                    # min fee-sonrasi EV -> sinyal
-    ORDER_SHARES: float = 10.0                   # pozisyon boyutu (share)
-    POLL_INTERVAL: float = 30.0                  # market/veri tarama araligi (sn)
-    MAX_POS_PER_MARKET: int = 1                  # market basi max acik pozisyon
-    FEE_BPS: float = 0.0                         # weather marketlerinde genelde fee yok
+    CITIES: str = "nyc,chicago,la,miami,sf"
+    EDGE_MARGIN: float = 0.06            # min fee-sonrasi EV -> sinyal
+    ORDER_SHARES: float = 10.0
+    POLL_INTERVAL: float = 45.0
+    FEE_BPS: float = 0.0
     FEE_EXP: float = 1.0
 
     DASHBOARD_PORT: int = 8095
@@ -152,10 +139,9 @@ class Settings:
             CLOB_API_SECRET=os.getenv("CLOB_API_SECRET"),
             CLOB_API_PASSPHRASE=os.getenv("CLOB_API_PASSPHRASE"),
             CITIES=_req("CITIES", "nyc,chicago,la,miami,sf"),
-            EDGE_MARGIN=_f("EDGE_MARGIN", 0.05),
+            EDGE_MARGIN=_f("EDGE_MARGIN", 0.06),
             ORDER_SHARES=_f("ORDER_SHARES", 10.0),
-            POLL_INTERVAL=_f("POLL_INTERVAL", 30.0),
-            MAX_POS_PER_MARKET=_i("MAX_POS_PER_MARKET", 1),
+            POLL_INTERVAL=_f("POLL_INTERVAL", 45.0),
             FEE_BPS=_f("FEE_BPS", 0.0),
             DASHBOARD_PORT=_i("DASHBOARD_PORT", 8095),
             DASHBOARD_TOKEN=os.getenv("DASHBOARD_TOKEN"),
@@ -170,6 +156,18 @@ def c2f(c: float) -> float:
     return c * 9.0 / 5.0 + 32.0
 
 
+def _list(v):
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            p = json.loads(v)
+            return p if isinstance(p, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
 # =====================================================================================
 # Veri baglayicilari  (METAR gozlem + Open-Meteo ensemble)
 # =====================================================================================
@@ -177,15 +175,14 @@ def c2f(c: float) -> float:
 METAR_URL = "https://aviationweather.gov/api/data/metar"
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 ENSEMBLE_MODELS = "gfs_seamless,ecmwf_ifs025,icon_seamless"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
 def observed_high_f(city_key: str) -> Optional[float]:
     """Istasyonun gece-yarisindan (yerel) beri gozlenen MAX sicakligi (F). METAR."""
     c = CITIES[city_key]
     tz = ZoneInfo(c["tz"])
-    now_local = datetime.now(tz)
-    midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    mid_epoch = midnight.timestamp()
+    mid_epoch = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     try:
         r = requests.get(METAR_URL, params={"ids": c["station"], "format": "json", "hours": 24}, timeout=12)
         if r.status_code != 200:
@@ -199,25 +196,21 @@ def observed_high_f(city_key: str) -> Optional[float]:
     for o in obs:
         try:
             ts = float(o.get("obsTime"))
-            temp_c = o.get("temp")
-            if temp_c is None:
+            tc = o.get("temp")
+            if tc is None or ts < mid_epoch:
                 continue
-            temp_c = float(temp_c)
+            f = c2f(float(tc))
         except (TypeError, ValueError):
             continue
-        if ts < mid_epoch:
-            continue
-        f = c2f(temp_c)
         if best is None or f > best:
             best = f
     return round(best, 1) if best is not None else None
 
 
-def ensemble_prob_ge(city_key: str, threshold_f: float, h_obs: Optional[float]) -> Optional[dict]:
-    """P(gunun final high'i >= T) = final_max>=T olan ensemble uye orani.
+def ensemble_finals(city_key: str, h_obs: Optional[float]) -> Optional[dict]:
+    """Her ensemble uyesi icin final_max = max(H_obs, uyenin kalan-gun saatlik max'i) (F).
 
-    final_max = max(H_obs, uyenin kalan-gun saatlik max'i). Dondurur:
-    {"p": olasilik, "members": n, "remaining_hours": k, "peak_passed": bool}
+    Dondurur {"finals": [...], "remaining_hours": k, "peak_passed": bool}
     """
     c = CITIES[city_key]
     tz = ZoneInfo(c["tz"])
@@ -236,14 +229,10 @@ def ensemble_prob_ge(city_key: str, threshold_f: float, h_obs: Optional[float]) 
     if not isinstance(hourly, dict):
         return None
     times = hourly.get("time") or []
-    member_keys = [k for k in hourly if k.startswith("temperature_2m_member")]
-    if not member_keys:
-        # bazi modeller tek uye -> temperature_2m
-        if "temperature_2m" in hourly:
-            member_keys = ["temperature_2m"]
-        else:
-            return None
-    # kalan gun (bugun, su andan itibaren) indexleri
+    keys = [k for k in hourly if k.startswith("temperature_2m_member")] or (
+        ["temperature_2m"] if "temperature_2m" in hourly else [])
+    if not keys:
+        return None
     rem_idx = []
     for i, t in enumerate(times):
         try:
@@ -255,29 +244,49 @@ def ensemble_prob_ge(city_key: str, threshold_f: float, h_obs: Optional[float]) 
         except Exception:
             continue
     base = h_obs if h_obs is not None else -999.0
-    hits = 0
-    total = 0
-    any_reach = False
-    for m in member_keys:
-        vals = hourly.get(m) or []
+    finals = []
+    any_exceed = False
+    for k in keys:
+        vals = hourly.get(k) or []
         rem = [vals[i] for i in rem_idx if i < len(vals) and vals[i] is not None]
-        rem_max = max(rem) if rem else -999.0
-        if rem_max >= threshold_f:
-            any_reach = True
-        final = max(base, rem_max)
-        total += 1
-        if final >= threshold_f:
-            hits += 1
-    if total == 0:
+        rmax = max(rem) if rem else -999.0
+        if h_obs is not None and rmax > h_obs:
+            any_exceed = True
+        finals.append(max(base, rmax))
+    return {"finals": finals, "remaining_hours": len(rem_idx),
+            "peak_passed": (h_obs is not None and not any_exceed)}
+
+
+def bucket_prob(finals: list[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
+    """P(final_high (yuvarlanmis) bucket [lo,hi] icinde)."""
+    if not finals:
         return None
-    # zirve gecti mi: hicbir uye kalan gunde esige ulasamiyorsa (ve H_obs<T)
-    peak_passed = (not any_reach)
-    return {"p": round(hits / total, 3), "members": total,
-            "remaining_hours": len(rem_idx), "peak_passed": peak_passed}
+    c = 0
+    for f in finals:
+        r = round(f)
+        if (lo is None or r >= lo) and (hi is None or r <= hi):
+            c += 1
+    return round(c / len(finals), 3)
+
+
+def final_high_f(city_key: str, date_local: str) -> Optional[float]:
+    """Belirli gunun final gozlenen high'i (Open-Meteo archive)."""
+    c = CITIES[city_key]
+    try:
+        r = requests.get(ARCHIVE_URL, params={
+            "latitude": c["lat"], "longitude": c["lon"], "start_date": date_local,
+            "end_date": date_local, "daily": "temperature_2m_max",
+            "temperature_unit": "fahrenheit", "timezone": c["tz"]}, timeout=15)
+        if r.status_code != 200:
+            return None
+        arr = (r.json().get("daily") or {}).get("temperature_2m_max") or []
+        return round(float(arr[0]), 1) if arr else None
+    except Exception:
+        return None
 
 
 # =====================================================================================
-# CLOB istemci (order book + fee + canli emir)  -- signal_bot deseni
+# CLOB istemci (order book + canli emir)
 # =====================================================================================
 
 _SDK = False
@@ -293,25 +302,23 @@ except Exception:
 CLOB_PUBLIC = "https://clob.polymarket.com"
 
 
-def public_best_ask(token: str) -> tuple[Optional[float], float]:
-    """Public /book ile en iyi ask (auth gerekmez)."""
+def public_best_ask(token: str) -> Optional[float]:
     try:
         r = requests.get(f"{CLOB_PUBLIC}/book", params={"token_id": token}, timeout=10)
         if r.status_code != 200:
-            return None, 0.0
+            return None
         book = r.json()
     except Exception:
-        return None, 0.0
+        return None
     best = None
-    sz = 0.0
     for a in (book.get("asks") or []):
         try:
-            p = float(a["price"]); s = float(a["size"])
+            p = float(a["price"])
         except (KeyError, ValueError, TypeError):
             continue
         if best is None or p < best:
-            best, sz = p, s
-    return best, sz
+            best = p
+    return best
 
 
 class Clob:
@@ -337,7 +344,7 @@ class Clob:
 
     async def buy_fok(self, token: str, price: float, shares: float) -> Optional[str]:
         if self._c is None:
-            logger.error("CLOB baglanmadi; canli emir gonderilemiyor (gecerli PRIVATE_KEY gerekir).")
+            logger.error("CLOB baglanmadi; canli emir gonderilemiyor.")
             return None
         def go():
             tick = str(self._c.get_tick_size(token))
@@ -350,7 +357,7 @@ class Clob:
         try:
             resp = await asyncio.to_thread(go)
         except Exception as exc:
-            logger.error("Canli emir hatasi token=%s: %s", token[:10], exc)
+            logger.error("Canli emir hatasi: %s", exc)
             return None
         for k in ("orderID", "orderId", "id", "order_id"):
             v = resp.get(k) if isinstance(resp, dict) else getattr(resp, k, None)
@@ -360,137 +367,173 @@ class Clob:
 
 
 # =====================================================================================
-# Market kesfi (weather high-temp binary marketleri)
+# Weather event / bucket kesfi (Gamma /events?slug=)
 # =====================================================================================
 
-def _list(v):
-    if isinstance(v, list):
-        return v
-    if isinstance(v, str):
-        try:
-            p = json.loads(v)
-            return p if isinstance(p, list) else []
-        except json.JSONDecodeError:
-            return []
-    return []
+def _today_date_slugs(off: int = 0) -> list[str]:
+    et = ZoneInfo("America/New_York")
+    d = datetime.now(et) + timedelta(days=off)
+    mon = d.strftime("%B").lower()
+    return [f"{mon}-{d.day}-{d.year}", f"{mon}-{d.day}"]
 
 
-# esik: "85F", "85 °F", "85 degrees", "above 85", "or higher ... 85", ">= 85"
-_THRESH_RE = re.compile(r"(\d{2,3})\s*(?:°|degrees?|\bf\b|℉)", re.IGNORECASE)
-
-
-def _parse_threshold(q: str) -> Optional[float]:
-    m = _THRESH_RE.search(q)
+# bucket etiketi -> (lo, hi). "77F or below"->(None,77) "78-79F"->(78,79) "96F or higher"->(96,None)
+def parse_bucket(title: str) -> Optional[tuple[Optional[float], Optional[float]]]:
+    t = title.lower().replace("°", "").replace("f", "").strip()
+    m = re.search(r"(\d+)\s*or\s*(?:below|lower)", t)
     if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    # yedek: "high of 85" / "reach 85"
-    m2 = re.search(r"(?:high|reach|hit|exceed|above|over)\D{0,6}(\d{2,3})", q, re.IGNORECASE)
-    return float(m2.group(1)) if m2 else None
+        return (None, float(m.group(1)))
+    m = re.search(r"(\d+)\s*or\s*(?:higher|above)", t)
+    if m:
+        return (float(m.group(1)), None)
+    m = re.search(r"(\d+)\s*-\s*(\d+)", t)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    m = re.search(r"(\d+)", t)
+    if m:
+        return (float(m.group(1)), float(m.group(1)))
+    return None
 
 
 @dataclass
-class WxMarket:
-    slug: str
-    question: str
-    city: str
-    threshold: float
+class Bucket:
+    label: str
+    lo: Optional[float]
+    hi: Optional[float]
     yes_token: str
     no_token: str
-    end_iso: str
+    yes_price: float
+    no_price: float
 
 
-def discover_weather_markets(s: Settings) -> list[WxMarket]:
-    """Gamma'dan aktif weather high-temp binary marketlerini bul (secili sehirler)."""
-    out: list[WxMarket] = []
-    offset = 0
-    page = 500
-    safety = 0
-    cities = set(s.city_list)
-    while True:
+@dataclass
+class WxEvent:
+    city: str
+    slug: str
+    date: str            # sehrin yerel tarihi (YYYY-MM-DD)
+    buckets: list[Bucket]
+
+
+def _fetch_event(gamma: str, slug: str) -> Optional[dict]:
+    try:
+        r = requests.get(f"{gamma}/events", params={"slug": slug}, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    evs = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    return evs[0] if evs else None
+
+
+def _parse_event(ev: dict, city: str, slug: str, date_local: str) -> Optional[WxEvent]:
+    buckets: list[Bucket] = []
+    for m in (ev.get("markets") or []):
+        rng = parse_bucket(str(m.get("groupItemTitle") or m.get("question") or ""))
+        toks = _list(m.get("clobTokenIds"))
+        if rng is None or len(toks) != 2:
+            continue
+        outs = [str(o).strip().lower() for o in _list(m.get("outcomes"))]
+        pr = _list(m.get("outcomePrices"))
+        yi = outs.index("yes") if "yes" in outs else 0
+        ni = 1 - yi if len(toks) == 2 else 1
         try:
-            r = requests.get(f"{s.GAMMA_HOST}/markets",
-                             params={"active": "true", "closed": "false", "limit": page, "offset": offset},
-                             timeout=25)
-            if r.status_code != 200:
-                break
-            data = r.json()
-        except Exception:
-            break
-        if not isinstance(data, list) or not data:
-            break
-        for m in data:
-            q = str(m.get("question") or m.get("title") or "")
-            ql = q.lower()
-            if not any(w in ql for w in ("temperature", "temp", "high", "hot", "degrees", "°", "warm")):
-                continue
-            ck = _match_city(q)
-            if ck is None or ck not in cities:
-                continue
-            if any(w in ql for w in ("low temp", "lowest", "minimum", "average", "coldest")):
-                continue  # simdilik sadece HIGH
-            toks = _list(m.get("clobTokenIds"))
-            if len(toks) != 2:
-                continue
-            T = _parse_threshold(q)
-            if T is None:
-                continue
-            outs = [str(o).strip().lower() for o in _list(m.get("outcomes"))]
-            yi = next((i for i, o in enumerate(outs) if o in ("yes", "up", "higher")), 0)
-            ni = next((i for i, o in enumerate(outs) if o in ("no", "down", "lower")), 1)
-            out.append(WxMarket(
-                slug=str(m.get("slug", "")), question=q[:110], city=ck, threshold=T,
-                yes_token=str(toks[yi]), no_token=str(toks[ni]),
-                end_iso=str(m.get("endDate") or m.get("endDateIso") or ""),
-            ))
-        offset += len(data)
-        safety += 1
-        if safety > 60:
-            break
-    return out
+            yp = float(pr[yi]); npx = float(pr[ni])
+        except (IndexError, ValueError, TypeError):
+            yp = npx = -1.0
+        buckets.append(Bucket(
+            label=str(m.get("groupItemTitle") or ""), lo=rng[0], hi=rng[1],
+            yes_token=str(toks[yi]), no_token=str(toks[ni]), yes_price=yp, no_price=npx))
+    if not buckets:
+        return None
+    return WxEvent(city=city, slug=slug, date=date_local, buckets=buckets)
+
+
+class Discovery:
+    """Sehir basi BUGUNku weather event'ini bulur; calisan slug'i cache'ler."""
+
+    def __init__(self, s: Settings) -> None:
+        self.s = s
+        self._slug_cache: dict[str, str] = {}   # city -> calisan slug
+
+    def _local_date(self, city: str) -> str:
+        return datetime.now(ZoneInfo(CITIES[city]["tz"])).strftime("%Y-%m-%d")
+
+    def find(self) -> dict[str, WxEvent]:
+        out: dict[str, WxEvent] = {}
+        for ck in self.s.city_list:
+            date_local = self._local_date(ck)
+            ev = None
+            # once cache'lenmis slug
+            cached = self._slug_cache.get(ck)
+            if cached:
+                raw = _fetch_event(self.s.GAMMA_HOST, cached)
+                if raw:
+                    ev = _parse_event(raw, ck, cached, date_local)
+            if ev is None:
+                # bugunku tarih slug'lariyla dene
+                for name in CITIES[ck]["slugs"]:
+                    for tmpl in SLUG_TEMPLATES:
+                        for ds in _today_date_slugs(0):
+                            slug = tmpl.format(n=name, d=ds)
+                            raw = _fetch_event(self.s.GAMMA_HOST, slug)
+                            if not raw:
+                                continue
+                            parsed = _parse_event(raw, ck, slug, date_local)
+                            if parsed:
+                                ev = parsed
+                                self._slug_cache[ck] = slug
+                                break
+                        if ev:
+                            break
+                    if ev:
+                        break
+            if ev:
+                out[ck] = ev
+        return out
 
 
 # =====================================================================================
-# Strateji (edge motoru + paper + resolution)
+# Strateji (bucket edge motoru + paper + resolution)
 # =====================================================================================
 
 @dataclass
 class Position:
-    slug: str
     city: str
-    threshold: float
-    side: str            # "YES" / "NO"
+    date: str
+    bucket: str
+    lo: Optional[float]
+    hi: Optional[float]
+    side: str
     token: str
     entry_price: float
     shares: float
-    p_yes: float
+    p_bucket: float
     h_obs: float
     live: bool
     order_id: str = ""
-    ts: float = 0.0
-    date_local: str = ""
 
 
 class Strategy:
     def __init__(self, s: Settings, clob: Clob) -> None:
         self.s = s
         self.clob = clob
-        self.markets: list[WxMarket] = []
-        self.view: dict[str, dict] = {}     # slug -> son hesap (dashboard)
-        self.open_pos: dict[str, Position] = {}   # slug -> acik pozisyon
+        self.disc = Discovery(s)
+        self.events: dict[str, WxEvent] = {}
+        self.view: dict[str, dict] = {}       # city -> dashboard gorunumu
+        self.open_pos: dict[str, Position] = {}   # "city:date" -> pozisyon
         self.live_armed = False
-        self.events: deque = deque(maxlen=80)
+        self.events_log: deque = deque(maxlen=80)
         self.stats = {"paper_trades": 0, "paper_wins": 0, "paper_pnl": 0.0,
                       "live_trades": 0, "live_wins": 0, "live_pnl": 0.0}
         self.equity: deque = deque(maxlen=300)
         self.started = time.time()
-        self._last_discover = 0.0
+        self._last_disc = 0.0
         self._obs_cache: dict[str, tuple[float, Optional[float]]] = {}
+        self._ens_cache: dict[str, tuple[float, Optional[dict]]] = {}
 
     def _emit(self, msg: str) -> None:
-        self.events.appendleft(f"{time.strftime('%H:%M:%S')} {msg}")
+        self.events_log.appendleft(f"{time.strftime('%H:%M:%S')} {msg}")
 
     def _fee(self, price: float) -> float:
         rate = self.s.FEE_BPS / 10000.0
@@ -501,123 +544,115 @@ class Strategy:
     def _local_date(self, city: str) -> str:
         return datetime.now(ZoneInfo(CITIES[city]["tz"])).strftime("%Y-%m-%d")
 
-    async def step(self) -> None:
-        # market listesini periyodik yenile
-        if time.time() - self._last_discover > 300 or not self.markets:
-            self.markets = await asyncio.to_thread(discover_weather_markets, self.s)
-            self._last_discover = time.time()
-            self._emit(f"kesif: {len(self.markets)} weather high-temp market")
-        await self._resolve_closed()
-        for m in self.markets:
-            await self._eval_market(m)
-
     async def _obs(self, city: str) -> Optional[float]:
-        # 5 dk cache (METAR saatlik)
         c = self._obs_cache.get(city)
+        if c and time.time() - c[0] < 240:
+            return c[1]
+        v = await asyncio.to_thread(observed_high_f, city)
+        self._obs_cache[city] = (time.time(), v)
+        return v
+
+    async def _ens(self, city: str, h_obs: Optional[float]) -> Optional[dict]:
+        c = self._ens_cache.get(city)
         if c and time.time() - c[0] < 300:
             return c[1]
-        val = await asyncio.to_thread(observed_high_f, city)
-        self._obs_cache[city] = (time.time(), val)
-        return val
+        v = await asyncio.to_thread(ensemble_finals, city, h_obs)
+        self._ens_cache[city] = (time.time(), v)
+        return v
 
-    async def _eval_market(self, m: WxMarket) -> None:
-        h_obs = await self._obs(m.city)
-        ens = await asyncio.to_thread(ensemble_prob_ge, m.city, m.threshold, h_obs)
+    async def step(self) -> None:
+        if time.time() - self._last_disc > 120 or not self.events:
+            self.events = await asyncio.to_thread(self.disc.find)
+            self._last_disc = time.time()
+            self._emit(f"kesif: {len(self.events)} sehir event bulundu "
+                       f"({', '.join(CITIES[c]['name'] for c in self.events)})")
+        await self._resolve_closed()
+        for ck, ev in self.events.items():
+            await self._eval_event(ck, ev)
+
+    async def _eval_event(self, city: str, ev: WxEvent) -> None:
+        h_obs = await self._obs(city)
+        ens = await self._ens(city, h_obs)
         if ens is None:
             return
-        p_yes = ens["p"]
-        ya, _ = await asyncio.to_thread(public_best_ask, m.yes_token)
-        na, _ = await asyncio.to_thread(public_best_ask, m.no_token)
-        ev_yes = ev_no = None
-        signal = "-"
-        if ya is not None:
-            ev_yes = p_yes - ya - self._fee(ya)
-        if na is not None:
-            ev_no = (1 - p_yes) - na - self._fee(na)
-        best_side = None
-        best_ev = None
-        if ev_yes is not None and (best_ev is None or ev_yes > best_ev):
-            best_ev, best_side = ev_yes, "YES"
-        if ev_no is not None and (best_ev is None or ev_no > best_ev):
-            best_ev, best_side = ev_no, "NO"
-        if best_ev is not None:
-            signal = (f"{best_side} (EV={best_ev:+.3f})" if best_ev >= self.s.EDGE_MARGIN
-                      else f"bekle (EV={best_ev:+.3f})")
-        self.view[m.slug] = {
-            "city": CITIES[m.city]["name"], "question": m.question, "threshold": m.threshold,
-            "h_obs": h_obs, "p_yes": p_yes, "peak_passed": ens["peak_passed"],
-            "yes_ask": ya, "no_ask": na, "ev_yes": (round(ev_yes, 3) if ev_yes is not None else None),
-            "ev_no": (round(ev_no, 3) if ev_no is not None else None), "signal": signal,
-            "open": m.slug in self.open_pos,
-        }
-        # giris
-        if (best_side and best_ev is not None and best_ev >= self.s.EDGE_MARGIN
-                and m.slug not in self.open_pos):
-            token = m.yes_token if best_side == "YES" else m.no_token
-            price = ya if best_side == "YES" else na
-            if price is not None:
-                await self._enter(m, best_side, token, price, p_yes, h_obs or 0.0)
+        finals = ens["finals"]
+        rows = []
+        best = None  # (ev_value, bucket, side, token, price, p)
+        for b in ev.buckets:
+            p = bucket_prob(finals, b.lo, b.hi)
+            if p is None:
+                continue
+            # fiyat: market outcomePrice (mid) -- hizli; canli girise gercek ask cekilir
+            ev_yes = p - b.yes_price - self._fee(b.yes_price) if b.yes_price >= 0 else None
+            ev_no = (1 - p) - b.no_price - self._fee(b.no_price) if b.no_price >= 0 else None
+            for side, evv, tok, price in (("YES", ev_yes, b.yes_token, b.yes_price),
+                                          ("NO", ev_no, b.no_token, b.no_price)):
+                if evv is not None and (best is None or evv > best[0]):
+                    best = (evv, b, side, tok, price, p)
+            rows.append({"label": b.label, "p": p, "yes": b.yes_price, "no": b.no_price,
+                         "ev_yes": (round(ev_yes, 3) if ev_yes is not None else None),
+                         "ev_no": (round(ev_no, 3) if ev_no is not None else None)})
+        sig = "-"
+        if best is not None:
+            sig = (f"{best[2]} {best[1].label} (EV={best[0]:+.3f})"
+                   if best[0] >= self.s.EDGE_MARGIN else f"bekle (en iyi EV={best[0]:+.3f})")
+        self.view[city] = {"city": CITIES[city]["name"], "date": ev.date, "h_obs": h_obs,
+                           "peak_passed": ens["peak_passed"], "remaining_hours": ens["remaining_hours"],
+                           "buckets": rows, "signal": sig,
+                           "open": f"{city}:{ev.date}" in self.open_pos}
+        key = f"{city}:{ev.date}"
+        if (best is not None and best[0] >= self.s.EDGE_MARGIN and key not in self.open_pos):
+            await self._enter(city, ev, best)
 
-    async def _enter(self, m: WxMarket, side: str, token: str, price: float,
-                     p_yes: float, h_obs: float) -> None:
-        live = self.live_armed
-        order_id = ""
-        if live:
-            order_id = await self.clob.buy_fok(token, price, self.s.ORDER_SHARES) or ""
-            if not order_id:
-                self._emit(f"CANLI REDDEDILDI {m.city} {side} @ {price:.3f}")
-                live = False
-        pos = Position(slug=m.slug, city=m.city, threshold=m.threshold, side=side, token=token,
-                       entry_price=price, shares=self.s.ORDER_SHARES, p_yes=p_yes, h_obs=h_obs,
-                       live=live, order_id=order_id, ts=time.time(), date_local=self._local_date(m.city))
-        self.open_pos[m.slug] = pos
+    async def _enter(self, city: str, ev: WxEvent, best) -> None:
+        evv, b, side, token, price, p = best
+        # canli: gercek ask'i teyit et (mid iyimser olabilir)
+        if self.live_armed:
+            real = await asyncio.to_thread(public_best_ask, token)
+            if real is None or (p - real - self._fee(real)) < self.s.EDGE_MARGIN:
+                return  # gercek ask'ta edge kalmadi
+            price = real
+            oid = await self.clob.buy_fok(token, price, self.s.ORDER_SHARES) or ""
+            if not oid:
+                self._emit(f"CANLI REDDEDILDI {CITIES[city]['name']} {side} {b.label}")
+                live = False; order_id = ""
+            else:
+                live = True; order_id = oid
+        else:
+            live = False; order_id = ""
+        h_obs = (await self._obs(city)) or 0.0
+        pos = Position(city=city, date=ev.date, bucket=b.label, lo=b.lo, hi=b.hi, side=side,
+                       token=token, entry_price=price, shares=self.s.ORDER_SHARES, p_bucket=p,
+                       h_obs=h_obs, live=live, order_id=order_id)
+        self.open_pos[f"{city}:{ev.date}"] = pos
         tag = "CANLI" if live else "PAPER"
-        self._emit(f"{tag} GIRIS {CITIES[m.city]['name']} >= {m.threshold:.0f}F {side} "
-                   f"@ {price:.3f} (P_yes={p_yes:.2f}, H_obs={h_obs:.1f})")
-        logger.info("%s giris %s %s T=%.0f @ %.3f P=%.2f Hobs=%.1f", tag, m.city, side,
-                    m.threshold, price, p_yes, h_obs)
+        self._emit(f"{tag} GIRIS {CITIES[city]['name']} {side} '{b.label}' @ {price:.3f} "
+                   f"(P={p:.2f}, H_obs={h_obs:.1f})")
+        logger.info("%s giris %s %s %s @ %.3f P=%.2f Hobs=%.1f", tag, city, side, b.label, price, p, h_obs)
 
     async def _resolve_closed(self) -> None:
-        """Pozisyonun sehir-gunu bitince final gozlenen high ile cozumle."""
-        for slug in list(self.open_pos.keys()):
-            pos = self.open_pos[slug]
-            today = self._local_date(pos.city)
-            if today <= pos.date_local:
-                continue  # pozisyonun gunu henuz bitmedi
-            final_high = await self._final_high(pos.city, pos.date_local)
-            if final_high is None:
+        for key in list(self.open_pos.keys()):
+            pos = self.open_pos[key]
+            if self._local_date(pos.city) <= pos.date:
+                continue  # gunu bitmedi
+            fh = await asyncio.to_thread(final_high_f, pos.city, pos.date)
+            if fh is None:
                 continue
-            won_yes = final_high >= pos.threshold
-            winner = "YES" if won_yes else "NO"
-            won = (pos.side == winner)
+            r = round(fh)
+            bucket_won = (pos.lo is None or r >= pos.lo) and (pos.hi is None or r <= pos.hi)
+            won = bucket_won if pos.side == "YES" else (not bucket_won)
             gross = (1.0 - pos.entry_price) if won else (-pos.entry_price)
             pnl = (gross - self._fee(pos.entry_price)) * pos.shares
-            self._book(pos, won, pnl, final_high, winner)
-            self.open_pos.pop(slug, None)
+            self._book(pos, won, pnl, fh, bucket_won)
+            self.open_pos.pop(key, None)
 
-    async def _final_high(self, city: str, date_local: str) -> Optional[float]:
-        """Belirli bir gunun final gozlenen high'i (Open-Meteo historical/archive)."""
-        c = CITIES[city]
-        try:
-            r = await asyncio.to_thread(requests.get,
-                "https://archive-api.open-meteo.com/v1/archive",
-                params={"latitude": c["lat"], "longitude": c["lon"], "start_date": date_local,
-                        "end_date": date_local, "daily": "temperature_2m_max",
-                        "temperature_unit": "fahrenheit", "timezone": c["tz"]}, timeout=15)
-            if r.status_code != 200:
-                return None
-            d = r.json()
-            arr = (d.get("daily") or {}).get("temperature_2m_max") or []
-            return float(arr[0]) if arr else None
-        except Exception:
-            return None
-
-    def _book(self, pos: Position, won: bool, pnl: float, final_high: float, winner: str) -> None:
-        rec = {"ts": datetime.now(timezone.utc).isoformat(), "slug": pos.slug, "city": pos.city,
-               "threshold": pos.threshold, "date": pos.date_local, "mode": ("live" if pos.live else "paper"),
-               "side": pos.side, "winner": winner, "won": won, "entry": round(pos.entry_price, 4),
-               "shares": pos.shares, "p_yes": round(pos.p_yes, 3), "h_obs_at_entry": round(pos.h_obs, 1),
-               "final_high": round(final_high, 1), "pnl": round(pnl, 4), "order_id": pos.order_id}
+    def _book(self, pos: Position, won: bool, pnl: float, final_high: float, bucket_won: bool) -> None:
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), "city": pos.city, "date": pos.date,
+               "bucket": pos.bucket, "mode": ("live" if pos.live else "paper"), "side": pos.side,
+               "bucket_won": bucket_won, "won": won, "entry": round(pos.entry_price, 4),
+               "shares": pos.shares, "p_bucket": round(pos.p_bucket, 3),
+               "h_obs_at_entry": round(pos.h_obs, 1), "final_high": round(final_high, 1),
+               "pnl": round(pnl, 4), "order_id": pos.order_id}
         try:
             with open(self.s.LEDGER_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
@@ -628,63 +663,61 @@ class Strategy:
         else:
             self.stats["paper_trades"] += 1; self.stats["paper_wins"] += int(won); self.stats["paper_pnl"] += pnl
             self.equity.append(round(self.stats["paper_pnl"], 4))
-        self._emit(f"SONUC {'CANLI' if pos.live else 'PAPER'} {CITIES[pos.city]['name']} "
-                   f">={pos.threshold:.0f} {pos.side} -> {'KAZANDI' if won else 'KAYBETTI'} "
-                   f"(final={final_high:.1f}, kazanan={winner}) PnL={pnl:+.2f}")
+        self._emit(f"SONUC {'CANLI' if pos.live else 'PAPER'} {CITIES[pos.city]['name']} {pos.side} "
+                   f"'{pos.bucket}' -> {'KAZANDI' if won else 'KAYBETTI'} (final={final_high:.1f}) PnL={pnl:+.2f}")
 
     def snapshot(self) -> dict:
         pt = self.stats["paper_trades"]; lt = self.stats["live_trades"]
         return {
             "mode": "LIVE ARMED" if self.live_armed else "PAPER",
             "uptime": int(time.time() - self.started),
-            "markets": [self.view[m.slug] for m in self.markets if m.slug in self.view],
-            "open_positions": [{"city": CITIES[p.city]["name"], "threshold": p.threshold,
-                                "side": p.side, "entry": p.entry_price, "live": p.live}
-                               for p in self.open_pos.values()],
+            "cities": [self.view[c] for c in self.events if c in self.view],
+            "open_positions": [{"city": CITIES[p.city]["name"], "bucket": p.bucket, "side": p.side,
+                                "entry": p.entry_price, "live": p.live} for p in self.open_pos.values()],
             "stats": {**self.stats,
                       "paper_winrate": (round(100 * self.stats["paper_wins"] / pt, 1) if pt else None),
                       "live_winrate": (round(100 * self.stats["live_wins"] / lt, 1) if lt else None)},
-            "equity": list(self.equity),
-            "events": list(self.events),
+            "equity": list(self.equity), "events": list(self.events_log),
             "edge_margin": self.s.EDGE_MARGIN,
         }
 
 
 # =====================================================================================
-# Dashboard (aiohttp)  -- signal_bot deseni
+# Dashboard (aiohttp)
 # =====================================================================================
 
 DASH_HTML = """<!doctype html><html lang=tr><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Weather-Bot</title>
 <style>
-:root{--bg:#0b0f14;--card:#141b24;--line:#243040;--fg:#e6edf3;--mut:#8b98a5;--grn:#2ea043;--red:#f85149;--blu:#388bfd;--yel:#d29922}
+:root{--bg:#0b0f14;--card:#141b24;--line:#243040;--fg:#e6edf3;--mut:#8b98a5;--grn:#2ea043;--red:#f85149;--blu:#388bfd}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,Segoe UI,sans-serif}
-.wrap{max-width:1100px;margin:0 auto;padding:16px}
-header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.wrap{max-width:1150px;margin:0 auto;padding:16px}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 h1{font-size:17px;margin:0}.mut{color:var(--mut)}
 .badge{padding:3px 10px;border-radius:999px;font-weight:700;font-size:12px}
 .paper{background:rgba(56,139,253,.15);color:var(--blu);border:1px solid var(--blu)}
 .live{background:rgba(248,81,73,.15);color:var(--red);border:1px solid var(--red)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:12px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
 .card h3{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut)}
 .big{font-size:20px;font-weight:700}
 button{font:inherit;font-weight:700;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
 .arm{background:var(--red);color:#fff}.disarm{background:var(--line);color:var(--fg)}
-.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:8px 0 14px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
-th{color:var(--mut)}.up{color:var(--grn)}.down{color:var(--red)}
-.log{background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:8px 0 12px}
+.city{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+.city h2{margin:0 0 2px;font-size:16px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:4px 8px;border-bottom:1px solid #1c2530;text-align:right}th:first-child,td:first-child{text-align:left}
+th{color:var(--mut)}.hot{background:rgba(210,153,34,.12)}.up{color:var(--grn)}.down{color:var(--red)}
+.log{background:#0b0f14;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:200px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px}
 .log div{padding:2px 0;border-bottom:1px solid #161d27}
-svg{width:100%;height:56px}
+svg{width:100%;height:54px}
 </style></head><body><div class=wrap>
-<header><h1>Weather-Bot · Polymarket sicaklik ("zaten oldu" edge)</h1>
+<header><h1>Weather-Bot · Polymarket sıcaklık ("zaten oldu" edge)</h1>
 <span id=mode class="badge paper">...</span><span class=mut id=up></span>
 <span class=mut style=margin-left:auto id=clk></span></header>
 
-<div class=row>
-<button id=armbtn class=arm>▶ CANLIYA GEÇ (ARM)</button>
+<div class=row><button id=armbtn class=arm>▶ CANLIYA GEÇ (ARM)</button>
 <span class=mut id=armnote>Paper modda — gerçek emir gitmiyor.</span></div>
 
 <div class=grid>
@@ -694,15 +727,11 @@ svg{width:100%;height:56px}
 <div class=card><h3>Canlı işlem</h3><div class=big id=lt>0</div></div>
 <div class=card><h3>Canlı PnL</h3><div class=big id=lpnl>$0</div></div>
 </div>
+<div class=card style=margin-bottom:12px><h3>Paper PnL eğrisi</h3><svg id=eq viewBox="0 0 400 54" preserveAspectRatio=none></svg></div>
 
-<div class=card style=margin-bottom:14px><h3>Paper PnL eğrisi</h3><svg id=eq viewBox="0 0 400 56" preserveAspectRatio=none></svg></div>
+<div id=cities></div>
 
-<div class=mut style=margin:6px 0>GÜNCEL MARKETLER (P_yes = model olasılığı, EV = fee sonrası)</div>
-<div class=card style=overflow-x:auto><table><thead><tr>
-<th>Şehir</th><th>Eşik°F</th><th>Gözlenen high</th><th>Zirve</th><th>P_yes</th><th>YES/NO ask</th><th>EV Y/N</th><th>Sinyal</th></tr></thead>
-<tbody id=mk></tbody></table></div>
-
-<div class=mut style=margin:14px 0 6px>OLAY / SONUÇ AKIŞI</div><div class=log id=log></div>
+<div class=mut style=margin:12px 0 6px>OLAY / SONUÇ AKIŞI</div><div class=log id=log></div>
 </div>
 <script>
 const KEY=new URLSearchParams(location.search).get("key");
@@ -710,7 +739,7 @@ const q=i=>document.getElementById(i);const q2=()=>KEY?("?key="+encodeURICompone
 async function arm(on){await fetch("/api/"+(on?"arm":"disarm")+q2(),{method:"POST"});tick();}
 q("armbtn").onclick=()=>{const live=q("mode").textContent==="LIVE ARMED";
  if(!live){if(confirm("CANLI moda geçilecek — gerçek emir gönderilecek. Emin misin?"))arm(true);}else arm(false);};
-function fmt(v,d=2){return v==null?"-":(+v).toFixed(d);}
+function f(v,d=2){return v==null?"-":(+v).toFixed(d);}
 async function tick(){try{
  const r=await fetch("/api/state"+q2());if(!r.ok){q("mode").textContent="ERİŞİM YOK";return;}
  const d=await r.json();const live=d.mode==="LIVE ARMED";
@@ -721,17 +750,23 @@ async function tick(){try{
  const s=d.stats;q("pt").textContent=s.paper_trades;q("pw").textContent=s.paper_winrate==null?"-":s.paper_winrate+"%";
  q("ppnl").textContent="$"+(s.paper_pnl||0).toFixed(2);q("lt").textContent=s.live_trades;q("lpnl").textContent="$"+(s.live_pnl||0).toFixed(2);
  const e=d.equity||[];if(e.length>1){const mn=Math.min(...e,0),mx=Math.max(...e,0),rg=(mx-mn)||1;
-  const pts=e.map((v,i)=>(400*i/(e.length-1)).toFixed(1)+","+(56-54*(v-mn)/rg).toFixed(1)).join(" ");
+  const pts=e.map((v,i)=>(400*i/(e.length-1)).toFixed(1)+","+(54-52*(v-mn)/rg).toFixed(1)).join(" ");
   q("eq").innerHTML='<polyline fill=none stroke='+(e[e.length-1]>=0?"#2ea043":"#f85149")+' stroke-width=2 points="'+pts+'"/>';}
- q("mk").innerHTML=(d.markets||[]).map(m=>{const sg=m.signal||"-";const cl=sg.startsWith("YES")?"up":sg.startsWith("NO")?"down":"";
-  return "<tr><td>"+m.city+"</td><td>"+fmt(m.threshold,0)+"</td><td>"+(m.h_obs==null?"-":fmt(m.h_obs,1))+"</td>"
-  +"<td>"+(m.peak_passed?"geçti":"—")+"</td><td>"+(100*m.p_yes).toFixed(0)+"%</td>"
-  +"<td>"+fmt(m.yes_ask,3)+" / "+fmt(m.no_ask,3)+"</td>"
-  +"<td>"+(m.ev_yes==null?"-":(m.ev_yes>0?"+":"")+fmt(m.ev_yes,3))+" / "+(m.ev_no==null?"-":(m.ev_no>0?"+":"")+fmt(m.ev_no,3))+"</td>"
-  +"<td class="+cl+">"+sg+"</td></tr>";}).join("")||"<tr><td colspan=8 class=mut>market bekleniyor…</td></tr>";
+ q("cities").innerHTML=(d.cities||[]).map(c=>{
+  const rows=(c.buckets||[]).map(b=>{const hit=b.p>=0.5;const evy=b.ev_yes,evn=b.ev_no;
+   return "<tr class="+(hit?"hot":"")+"><td>"+b.label+"</td><td>"+(100*b.p).toFixed(0)+"%</td>"
+   +"<td>"+f(b.yes,3)+"</td><td>"+f(b.no,3)+"</td>"
+   +"<td class="+(evy>0.06?"up":"")+">"+(evy==null?"-":(evy>0?"+":"")+f(evy,3))+"</td>"
+   +"<td class="+(evn>0.06?"up":"")+">"+(evn==null?"-":(evn>0?"+":"")+f(evn,3))+"</td></tr>";}).join("");
+  const sg=c.signal||"-";const scl=sg.startsWith("YES")||sg.startsWith("NO")?"up":"";
+  return "<div class=city><h2>"+c.city+" <span class=mut style=font-size:12px>· "+c.date
+   +" · gözlenen high "+(c.h_obs==null?"-":f(c.h_obs,1)+"°F")+(c.peak_passed?" (zirve geçti)":"")
+   +" · sinyal: <b class="+scl+">"+sg+"</b></span></h2>"
+   +"<table><thead><tr><th>Bucket</th><th>P</th><th>YES</th><th>NO</th><th>EV_Y</th><th>EV_N</th></tr></thead><tbody>"+rows+"</tbody></table></div>";
+ }).join("")||"<div class=mut>event bekleniyor…</div>";
  q("log").innerHTML=(d.events||[]).map(x=>"<div>"+x+"</div>").join("")||"<div class=mut>…</div>";
 }catch(e){q("mode").textContent="BAĞLANTI YOK";}}
-tick();setInterval(tick,3000);
+tick();setInterval(tick,4000);
 </script></body></html>"""
 
 
@@ -756,15 +791,13 @@ async def dashboard(strat: Strategy, stop: asyncio.Event) -> None:
     async def arm(req):
         if not ok(req):
             return web.json_response({"error": "unauthorized"}, status=401)
-        strat.live_armed = True
-        strat._emit(">>> CANLI MOD AÇILDI (dashboard)")
+        strat.live_armed = True; strat._emit(">>> CANLI MOD AÇILDI (dashboard)")
         return web.json_response({"armed": True})
 
     async def disarm(req):
         if not ok(req):
             return web.json_response({"error": "unauthorized"}, status=401)
-        strat.live_armed = False
-        strat._emit("<<< canli mod kapatildi")
+        strat.live_armed = False; strat._emit("<<< canli mod kapatildi")
         return web.json_response({"armed": False})
 
     app = web.Application()
@@ -774,8 +807,7 @@ async def dashboard(strat: Strategy, stop: asyncio.Event) -> None:
     app.router.add_post("/api/disarm", disarm)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", strat.s.DASHBOARD_PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", strat.s.DASHBOARD_PORT).start()
     logger.info("Dashboard: http://0.0.0.0:%d%s", strat.s.DASHBOARD_PORT,
                 " (?key=...)" if strat.s.DASHBOARD_TOKEN else "")
     try:
@@ -801,11 +833,10 @@ async def strategy_loop(strat: Strategy, stop: asyncio.Event) -> None:
 async def amain(s: Settings) -> None:
     clob = Clob(s)
     try:
-        await clob.connect()   # sadece canli ARM icin gerekli; paper order book public'ten okur
+        await clob.connect()
         logger.info("CLOB baglandi (canli ARM hazir).")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("CLOB baglanamadi: %s -> sadece PAPER calisir "
-                       "(canli ARM icin gecerli PRIVATE_KEY gerekir).", str(exc)[:120])
+        logger.warning("CLOB baglanamadi: %s -> sadece PAPER.", str(exc)[:120])
     strat = Strategy(s, clob)
     stop = asyncio.Event()
     await asyncio.gather(strategy_loop(strat, stop), dashboard(strat, stop))
@@ -819,108 +850,43 @@ def _check(s: Settings) -> None:
     for ck in s.city_list:
         c = CITIES[ck]
         h = observed_high_f(ck)
-        # ornek esik: gozlenen high civari
-        T = (round(h) if h else 80)
-        ens = ensemble_prob_ge(ck, T, h)
-        p = ens["p"] if ens else None
-        print(f"  {c['name']:<15} {c['station']}  gozlenen_high={h}F  "
-              f"P(>= {T}F)={p}  {'(zirve gecti)' if ens and ens['peak_passed'] else ''}")
-
-
-# sehir -> Polymarket slug adaylari
-SLUG_NAMES = {
-    "nyc": ["nyc", "new-york-city", "new-york"], "chicago": ["chicago"],
-    "la": ["la", "los-angeles"], "miami": ["miami"], "sf": ["sf", "san-francisco"],
-}
-# event slug sablonlari (ay-gun-yil doldurulur)
-SLUG_TEMPLATES = [
-    "highest-temperature-in-{n}-on-{d}",
-    "high-temperature-in-{n}-on-{d}",
-    "what-will-the-high-temperature-be-in-{n}-on-{d}",
-]
-
-
-def _date_slugs() -> list[str]:
-    from datetime import timedelta
-    et = ZoneInfo("America/New_York")
-    out: list[str] = []
-    for off in (0, 1):  # bugun + yarin
-        d = datetime.now(et) + timedelta(days=off)
-        mon = d.strftime("%B").lower()
-        out.append(f"{mon}-{d.day}-{d.year}")
-        out.append(f"{mon}-{d.day}")
-    return out
-
-
-def fetch_weather_events(s: Settings) -> list[dict]:
-    """Gamma /events?slug= ile sehir-basi weather event'lerini DOGRUDAN cek."""
-    events: list[dict] = []
-    seen: set[str] = set()
-    dates = _date_slugs()
-    for ck in s.city_list:
-        for name in SLUG_NAMES.get(ck, [ck]):
-            for tmpl in SLUG_TEMPLATES:
-                for ds in dates:
-                    slug = tmpl.format(n=name, d=ds)
-                    try:
-                        r = requests.get(f"{s.GAMMA_HOST}/events", params={"slug": slug}, timeout=12)
-                        if r.status_code != 200:
-                            continue
-                        data = r.json()
-                    except Exception:
-                        continue
-                    for ev in (data if isinstance(data, list) else [data] if isinstance(data, dict) else []):
-                        eid = str(ev.get("id") or ev.get("slug") or slug)
-                        if eid in seen:
-                            continue
-                        seen.add(eid)
-                        ev["_city"] = ck
-                        ev["_slug"] = slug
-                        events.append(ev)
-    return events
+        ens = ensemble_finals(ck, h)
+        if ens:
+            fs = ens["finals"]
+            lo, hi = (min(fs), max(fs)) if fs else (None, None)
+            print(f"  {c['name']:<15} {c['station']}  gozlenen_high={h}F  "
+                  f"ensemble final araligi={lo:.0f}-{hi:.0f}F ({len(fs)} uye)"
+                  f"{'  (zirve gecti)' if ens['peak_passed'] else ''}")
+        else:
+            print(f"  {c['name']:<15} {c['station']}  gozlenen_high={h}F  (ensemble alinamadi)")
 
 
 def _scan_diag(s: Settings) -> None:
-    """Teshis: /events?slug= ile weather event'lerini bulup HAM yapisini dok."""
-    print("Weather event TESHIS (slug-tabanli /events sorgusu) ...")
-    print(f"  denenen tarih slug'lari: {_date_slugs()}")
-    events = fetch_weather_events(s)
+    print("Weather event TESHIS (slug-tabanli /events) ...")
+    d = Discovery(s)
+    events = d.find()
     if not events:
-        print("\n  HIC EVENT BULUNAMADI. Slug sablonu/tarih formati yanlis olabilir.")
-        print("  Polymarket'te bir weather marketi ac, URL'deki tam slug'i bana yaz;")
-        print("  ornek: polymarket.com/event/<BURADAKI-SLUG> -> sablonu ona gore ayarlarim.")
+        print("  HIC EVENT BULUNAMADI. Bir Polymarket sicaklik marketinin tam slug'ini yaz.")
         return
-    for ev in events:
-        city = CITIES[ev["_city"]]["name"]
-        mkts = ev.get("markets") or []
-        print(f"\n=== [{city}] event: {ev.get('title') or ev.get('slug')} ({ev['_slug']}) "
-              f"-> {len(mkts)} market ===")
-        for m in mkts[:20]:
-            toks = _list(m.get("clobTokenIds"))
-            outs = _list(m.get("outcomes"))
-            prices = _list(m.get("outcomePrices"))
-            gt = m.get("groupItemTitle") or ""
-            q = str(m.get("question") or "")
-            print(f"   tok={len(toks)} out={outs} price={prices} title={gt!r} | {q[:70]}")
-    print("\nYorum: her market bir esik/bucket. groupItemTitle ('>= 90°F' / '83-84°')")
-    print("       ve outcomePrices'i gorunce parser + edge motorunu buna gore yazacagim.")
+    for ck, ev in events.items():
+        print(f"\n=== [{CITIES[ck]['name']}] {ev.slug} ({ev.date}) -> {len(ev.buckets)} bucket ===")
+        for b in ev.buckets:
+            print(f"   {b.label:<16} lo={b.lo} hi={b.hi}  YES={b.yes_price}  NO={b.no_price}")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Polymarket weather botu")
+    ap = argparse.ArgumentParser(description="Polymarket weather botu (bucket edge)")
     ap.add_argument("--check", action="store_true", help="config + veri baglaci self-test")
-    ap.add_argument("--scan", action="store_true", help="aktif weather marketlerini listele")
+    ap.add_argument("--scan", action="store_true", help="aktif weather event/bucket'lari listele")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     for n in ("aiohttp", "httpx", "httpcore", "urllib3", "web3", "py_clob_client_v2"):
         logging.getLogger(n).setLevel(logging.WARNING)
     s = Settings.load()
     if args.check:
-        _check(s)
-        return
+        _check(s); return
     if args.scan:
-        _scan_diag(s)
-        return
+        _scan_diag(s); return
     logger.info("Weather-Bot basladi (PAPER). Canliya gecis dashboard'dan ARM ile.")
     try:
         asyncio.run(amain(s))
