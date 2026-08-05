@@ -827,47 +827,83 @@ def _check(s: Settings) -> None:
               f"P(>= {T}F)={p}  {'(zirve gecti)' if ens and ens['peak_passed'] else ''}")
 
 
+# sehir -> Polymarket slug adaylari
+SLUG_NAMES = {
+    "nyc": ["nyc", "new-york-city", "new-york"], "chicago": ["chicago"],
+    "la": ["la", "los-angeles"], "miami": ["miami"], "sf": ["sf", "san-francisco"],
+}
+# event slug sablonlari (ay-gun-yil doldurulur)
+SLUG_TEMPLATES = [
+    "highest-temperature-in-{n}-on-{d}",
+    "high-temperature-in-{n}-on-{d}",
+    "what-will-the-high-temperature-be-in-{n}-on-{d}",
+]
+
+
+def _date_slugs() -> list[str]:
+    from datetime import timedelta
+    et = ZoneInfo("America/New_York")
+    out: list[str] = []
+    for off in (0, 1):  # bugun + yarin
+        d = datetime.now(et) + timedelta(days=off)
+        mon = d.strftime("%B").lower()
+        out.append(f"{mon}-{d.day}-{d.year}")
+        out.append(f"{mon}-{d.day}")
+    return out
+
+
+def fetch_weather_events(s: Settings) -> list[dict]:
+    """Gamma /events?slug= ile sehir-basi weather event'lerini DOGRUDAN cek."""
+    events: list[dict] = []
+    seen: set[str] = set()
+    dates = _date_slugs()
+    for ck in s.city_list:
+        for name in SLUG_NAMES.get(ck, [ck]):
+            for tmpl in SLUG_TEMPLATES:
+                for ds in dates:
+                    slug = tmpl.format(n=name, d=ds)
+                    try:
+                        r = requests.get(f"{s.GAMMA_HOST}/events", params={"slug": slug}, timeout=12)
+                        if r.status_code != 200:
+                            continue
+                        data = r.json()
+                    except Exception:
+                        continue
+                    for ev in (data if isinstance(data, list) else [data] if isinstance(data, dict) else []):
+                        eid = str(ev.get("id") or ev.get("slug") or slug)
+                        if eid in seen:
+                            continue
+                        seen.add(eid)
+                        ev["_city"] = ck
+                        ev["_slug"] = slug
+                        events.append(ev)
+    return events
+
+
 def _scan_diag(s: Settings) -> None:
-    """Teshis: weather-anahtar + sehir eslesen marketleri HAM yapisiyla dok."""
-    kws = ("temperature", "temp", "°", "degrees", "warm", "hottest", "high", "weather")
-    scanned = 0
-    wx = 0
-    offset = 0
-    page = 500
-    safety = 0
-    print("Weather-market TESHIS taramasi (ham yapi) ...")
-    while True:
-        try:
-            r = requests.get(f"{s.GAMMA_HOST}/markets",
-                             params={"active": "true", "closed": "false", "limit": page, "offset": offset},
-                             timeout=25)
-            if r.status_code != 200:
-                print(f"  Gamma status {r.status_code} (offset={offset}), duruyor")
-                break
-            data = r.json()
-        except Exception as exc:
-            print(f"  hata: {exc}")
-            break
-        if not isinstance(data, list) or not data:
-            break
-        for m in data:
-            scanned += 1
-            q = str(m.get("question") or m.get("title") or "")
-            ql = q.lower()
-            city = _match_city(q)
-            if city and any(k in ql for k in kws):
-                wx += 1
-                toks = _list(m.get("clobTokenIds"))
-                outs = _list(m.get("outcomes"))
-                T = _parse_threshold(q)
-                print(f"  [{CITIES[city]['name']:<13}] tok={len(toks)} T={T} out={outs}  | {q[:82]}")
-        offset += len(data)
-        safety += 1
-        if safety > 60:
-            break
-    print(f"\ntaranan={scanned}  weather+sehir eslesme={wx}")
-    print("Yorum: tok=2 -> binary (mevcut parser calisir). tok>2 -> cok-sonuclu (parser guncellenmeli).")
-    print("       Hic eslesme yoksa -> weather marketleri offset capinin otesinde; farkli sorgu gerekir.")
+    """Teshis: /events?slug= ile weather event'lerini bulup HAM yapisini dok."""
+    print("Weather event TESHIS (slug-tabanli /events sorgusu) ...")
+    print(f"  denenen tarih slug'lari: {_date_slugs()}")
+    events = fetch_weather_events(s)
+    if not events:
+        print("\n  HIC EVENT BULUNAMADI. Slug sablonu/tarih formati yanlis olabilir.")
+        print("  Polymarket'te bir weather marketi ac, URL'deki tam slug'i bana yaz;")
+        print("  ornek: polymarket.com/event/<BURADAKI-SLUG> -> sablonu ona gore ayarlarim.")
+        return
+    for ev in events:
+        city = CITIES[ev["_city"]]["name"]
+        mkts = ev.get("markets") or []
+        print(f"\n=== [{city}] event: {ev.get('title') or ev.get('slug')} ({ev['_slug']}) "
+              f"-> {len(mkts)} market ===")
+        for m in mkts[:20]:
+            toks = _list(m.get("clobTokenIds"))
+            outs = _list(m.get("outcomes"))
+            prices = _list(m.get("outcomePrices"))
+            gt = m.get("groupItemTitle") or ""
+            q = str(m.get("question") or "")
+            print(f"   tok={len(toks)} out={outs} price={prices} title={gt!r} | {q[:70]}")
+    print("\nYorum: her market bir esik/bucket. groupItemTitle ('>= 90°F' / '83-84°')")
+    print("       ve outcomePrices'i gorunce parser + edge motorunu buna gore yazacagim.")
 
 
 def main() -> None:
