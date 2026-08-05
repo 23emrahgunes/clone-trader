@@ -47,7 +47,8 @@ def fetch_markets() -> list:
     """Tum aktif, kapanmamis marketleri sayfali cek."""
     out: list = []
     offset = 0
-    page = 500
+    page = 500          # istenen; Gamma daha az dondurebilir (genelde 100)
+    safety = 0
     while True:
         try:
             r = S.get(f"{GAMMA}/markets",
@@ -60,14 +61,16 @@ def fetch_markets() -> list:
         except Exception as exc:
             print(f"  Gamma hata: {exc}", flush=True)
             break
-        if not data:
+        if not data:                       # bos donunce bitti
             break
         out.extend(data)
-        print(f"  {len(out)} market cekildi...", flush=True)
-        if len(data) < page:
-            break
-        offset += page
+        offset += len(data)                # GELEN KADAR ilerlet (page ile karsilastirma yok)
+        if len(out) % 500 < len(data):
+            print(f"  {len(out)} market cekildi...", flush=True)
         if LIMIT and len(out) >= LIMIT:
+            break
+        safety += 1
+        if safety > 300:                   # guvenlik (max ~30k market)
             break
     return out[:LIMIT] if LIMIT else out
 
