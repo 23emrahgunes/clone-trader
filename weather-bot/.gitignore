@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.log
+*.jsonl
+.venv/
+get-pip.py
+backups/

@@ -1,0 +1,8 @@
+# Weather-Bot bagimliliklari
+py-clob-client-v2
+web3>=6.15.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+eth-account>=0.11.0
+tzdata>=2024.1
