@@ -61,16 +61,16 @@ def fetch_markets() -> list:
         except Exception as exc:
             print(f"  Gamma hata: {exc}", flush=True)
             break
-        if not data:                       # bos donunce bitti
+        got = len(data) if isinstance(data, list) else 0
+        print(f"  offset={offset} -> {got} market (toplam {len(out) + got})", flush=True)
+        if got == 0:                       # bos donunce bitti
             break
         out.extend(data)
-        offset += len(data)                # GELEN KADAR ilerlet (page ile karsilastirma yok)
-        if len(out) % 500 < len(data):
-            print(f"  {len(out)} market cekildi...", flush=True)
+        offset += got                      # GELEN KADAR ilerlet
         if LIMIT and len(out) >= LIMIT:
             break
         safety += 1
-        if safety > 300:                   # guvenlik (max ~30k market)
+        if safety > 300:                   # guvenlik
             break
     return out[:LIMIT] if LIMIT else out
 
