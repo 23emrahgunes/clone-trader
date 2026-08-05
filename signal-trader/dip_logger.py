@@ -1,20 +1,16 @@
-"""Dip-logger: bir taraf ucuza (dip) DUSUNCE gercekten donuyor mu, ISTATISTIGINI olcer.
+"""Dip-logger v2: dip'ler GERCEKCI cikisla yakalanabilir mi? (READ-ONLY, emir yok)
 
-READ-ONLY -- ASLA emir gondermez. Kullanicinin gozlemini ("3-15-25 centten ters donus
-gordum") anekdottan RAKAMA cevirir.
-
-Mantik: her ~1sn BTC 5dk marketinin YES/NO order book'unu izle. Bir tarafin en iyi ASK'i
-bir esige (25c/15c/5c) ilk kez dusunce -> "dip girisi" (o an ASK'tan ALIRDIN). Sonra o
-tarafin en iyi BID'ini pencere sonuna kadar takip et -> ulastigi en yuksek bid = en iyi
-cikis (BID'e SATARDIN). Gercekci scalp PnL = max_bid - dip_ask - fee(al) - fee(sat).
-
-Boylece SURVIVORSHIP'siz gorursun: dip'lerin YUZDE KACI donuyor, ortalama gercekci PnL
-kac, ve derinlige gore (25 vs 5 cent) fark var mi.
+Fark: v1 cikisi max_bid (tepe) idi -> LOOK-AHEAD (gelecegi bilme) hatasi, sisirilmis.
+v2 GERCEKCI kural:
+  - Dip: bir tarafin en iyi ASK'i esige (25c/15c/5c) ilk kez dusunce -> ASK'tan AL.
+  - Take-profit: bid >= entry_ask + TP olunca -> o limitten SAT (gercekci dolum).
+  - TP hic dolmazsa -> pencere sonunda son bid'e sat (piyasa cikisi).
+  Look-ahead yok. Ayrica karsilastirma icin eski (max_bid) rakami da kaydedilir.
 
     python dip_logger.py
 
 Ayarlar (.env / ortam):
-  DIP_THRESHOLDS (vars. "0.25,0.15,0.05") · DIP_BOUNCE_MARGIN (vars. 0.02)
+  DIP_THRESHOLDS (vars. "0.25,0.15,0.05") · DIP_TAKE_PROFIT (vars. 0.03)
   DIP_SCAN_INTERVAL (vars. 1) · DIP_ASSET (vars. btc)
 """
 
@@ -47,7 +43,7 @@ API_KEY, API_SECRET, API_PASS = (os.getenv("CLOB_API_KEY"), os.getenv("CLOB_API_
 
 THRESHOLDS = sorted([float(x) for x in os.getenv("DIP_THRESHOLDS", "0.25,0.15,0.05").split(",") if x.strip()],
                     reverse=True)
-BOUNCE_MARGIN = float(os.getenv("DIP_BOUNCE_MARGIN", "0.02"))
+TAKE_PROFIT = float(os.getenv("DIP_TAKE_PROFIT", "0.03"))
 INTERVAL = float(os.getenv("DIP_SCAN_INTERVAL", "1"))
 ASSET = os.getenv("DIP_ASSET", "btc").lower()
 FEE_RATE = 0.10
@@ -110,7 +106,6 @@ def _find_market(names):
 
 
 def _best(book):
-    """(best_ask, best_bid) -> en dusuk ask, en yuksek bid."""
     def rows(side):
         s = getattr(book, side, None)
         if s is None and isinstance(book, dict):
@@ -141,13 +136,12 @@ class DipLogger:
         self.c = client
         self.window = -1
         self.market = None
-        self.events = {}    # (side, T) -> event (bu pencere)
-        self.last = {}      # side -> (bid, ask) son gorulen
+        self.events = {}    # (side, T) -> event
+        self.last = {}      # side -> (bid, ask)
         self.scans = 0
-        self.stats = {T: {"n": 0, "bounced": 0, "pnl": 0.0, "won": 0} for T in THRESHOLDS}
+        self.stats = {T: {"n": 0, "tp": 0, "real": 0.0, "look": 0.0} for T in THRESHOLDS}
 
     def _finalize(self):
-        """Kapanan pencerenin dip olaylarini sonuclandir."""
         if not self.events:
             self.last.clear()
             return
@@ -155,15 +149,25 @@ class DipLogger:
         nb = self.last.get("no", (0.0, 0.0))[0]
         winner = "yes" if yb >= nb else "no"
         for (side, T), e in self.events.items():
-            mb = e["max_bid"] if e["max_bid"] is not None else e["entry_bid"]
-            fee = _fee(e["entry_ask"]) + _fee(mb)
-            pnl = (mb or 0.0) - e["entry_ask"] - fee            # ask'tan al, max bid'e sat
-            bounced = (mb is not None) and (mb >= e["entry_ask"] + BOUNCE_MARGIN)
+            ea = e["entry_ask"]
+            mb = e["max_bid"] if e["max_bid"] is not None else e["entry_bid"] or 0.0
+            lb = e["last_bid"] if e["last_bid"] is not None else e["entry_bid"] or 0.0
+            # LOOK-AHEAD (eski, sisik): tepe bid'e sat
+            pnl_look = mb - ea - _fee(ea) - _fee(mb)
+            # GERCEKCI: TP dolduysa ea+TP'den sat, yoksa son bid'e sat
+            if e["tp_hit"]:
+                exit_r = ea + TAKE_PROFIT
+                pnl_real = TAKE_PROFIT - _fee(ea) - _fee(exit_r)
+            else:
+                exit_r = lb
+                pnl_real = lb - ea - _fee(ea) - _fee(lb)
             won = (side == winner)
             rec = {"ts": datetime.now(timezone.utc).isoformat(), "window": e["window"],
-                   "side": side, "threshold": T, "entry_ask": round(e["entry_ask"], 3),
-                   "entry_bid": round(e["entry_bid"] or 0.0, 3), "max_bid": round(mb or 0.0, 3),
-                   "bounced": bounced, "scalp_pnl_per_share": round(pnl, 4),
+                   "side": side, "threshold": T, "entry_ask": round(ea, 3),
+                   "entry_bid": round(e["entry_bid"] or 0.0, 3), "max_bid": round(mb, 3),
+                   "last_bid": round(lb, 3), "tp_hit": e["tp_hit"], "take_profit": TAKE_PROFIT,
+                   "exit_realistic": round(exit_r, 3),
+                   "scalp_realistic": round(pnl_real, 4), "scalp_lookahead": round(pnl_look, 4),
                    "resolved_won": won, "sec_to_close_at_dip": e["stc"]}
             try:
                 with open(HITS, "a", encoding="utf-8") as f:
@@ -171,11 +175,11 @@ class DipLogger:
             except Exception:
                 pass
             s = self.stats[T]
-            s["n"] += 1; s["bounced"] += int(bounced); s["pnl"] += pnl; s["won"] += int(won)
+            s["n"] += 1; s["tp"] += int(e["tp_hit"]); s["real"] += pnl_real; s["look"] += pnl_look
             print(f"[{time.strftime('%H:%M:%S')}] DIP {side.upper()} <= {T:.2f} "
-                  f"giris_ask={e['entry_ask']:.3f} max_bid={mb:.3f} "
-                  f"{'DONDU' if bounced else 'donmedi'} scalp={pnl:+.4f} "
-                  f"{'(kazanan taraf)' if won else ''}")
+                  f"ask={ea:.3f} {'TP-vurdu' if e['tp_hit'] else 'TP-yok'} "
+                  f"gercekci={pnl_real:+.4f} (lookahead={pnl_look:+.4f}) "
+                  f"{'(kazanan)' if won else ''}")
         self.events.clear(); self.last.clear()
 
     def scan_once(self):
@@ -204,23 +208,27 @@ class DipLogger:
                 key = (side, T)
                 if key not in self.events and ask <= T:
                     self.events[key] = {"window": win, "entry_ask": ask, "entry_bid": bid,
-                                        "max_bid": bid, "t": now, "stc": round(stc)}
+                                        "max_bid": bid, "last_bid": bid, "tp_hit": False,
+                                        "t": now, "stc": round(stc)}
                 if key in self.events and bid is not None:
                     e = self.events[key]
                     if e["max_bid"] is None or bid > e["max_bid"]:
                         e["max_bid"] = bid
+                    e["last_bid"] = bid
+                    if not e["tp_hit"] and bid >= e["entry_ask"] + TAKE_PROFIT:
+                        e["tp_hit"] = True
 
     def summary(self):
         parts = []
         for T in THRESHOLDS:
             s = self.stats[T]
             if s["n"]:
-                parts.append(f"<= {T:.2f}: n={s['n']} dondu={100*s['bounced']/s['n']:.0f}% "
-                             f"ort_scalp={s['pnl']/s['n']:+.4f} coz_kazanc={100*s['won']/s['n']:.0f}%")
+                parts.append(f"<= {T:.2f}: n={s['n']} tp={100*s['tp']/s['n']:.0f}% "
+                             f"GERCEKCI={s['real']/s['n']:+.4f} (look={s['look']/s['n']:+.4f})")
         return " | ".join(parts) if parts else "henuz dip yok"
 
     def run(self):
-        print(f"Dip-logger basladi. Esikler={THRESHOLDS} bounce_margin={BOUNCE_MARGIN} "
+        print(f"Dip-logger v2 (GERCEKCI cikis). Esikler={THRESHOLDS} take_profit={TAKE_PROFIT} "
               f"aralik={INTERVAL}sn -> '{HITS}'. (Ctrl+C ile dur)")
         while True:
             t0 = time.time()
