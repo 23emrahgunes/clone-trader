@@ -96,6 +96,13 @@ def _i(name: str, d: int) -> int:
         return d
 
 
+def _b(name: str, d: bool) -> bool:
+    v = os.getenv(name)
+    if not v or not v.strip():
+        return d
+    return v.strip().lower() in ("1", "true", "yes", "on", "y", "evet")
+
+
 @dataclass(frozen=True)
 class Settings:
     PRIVATE_KEY: str = field(repr=False)
@@ -110,6 +117,7 @@ class Settings:
 
     CITIES: str = "nyc,chicago,la,miami,sf"
     EDGE_MARGIN: float = 0.06            # min fee-sonrasi EV -> sinyal
+    PEAK_ONLY: bool = True              # sadece gunun zirvesi gectiyse (high kilitli) gir
     ORDER_SHARES: float = 10.0
     POLL_INTERVAL: float = 45.0
     FEE_BPS: float = 0.0
@@ -140,6 +148,7 @@ class Settings:
             CLOB_API_PASSPHRASE=os.getenv("CLOB_API_PASSPHRASE"),
             CITIES=_req("CITIES", "nyc,chicago,la,miami,sf"),
             EDGE_MARGIN=_f("EDGE_MARGIN", 0.06),
+            PEAK_ONLY=_b("PEAK_ONLY", True),
             ORDER_SHARES=_f("ORDER_SHARES", 10.0),
             POLL_INTERVAL=_f("POLL_INTERVAL", 45.0),
             FEE_BPS=_f("FEE_BPS", 0.0),
@@ -370,9 +379,9 @@ class Clob:
 # Weather event / bucket kesfi (Gamma /events?slug=)
 # =====================================================================================
 
-def _today_date_slugs(off: int = 0) -> list[str]:
-    et = ZoneInfo("America/New_York")
-    d = datetime.now(et) + timedelta(days=off)
+def _today_date_slugs(tz_name: str = "America/New_York") -> list[str]:
+    """Sehrin KENDI yerel tarihine gore slug adaylari (Pasifik/Dogu farki icin)."""
+    d = datetime.now(ZoneInfo(tz_name))
     mon = d.strftime("%B").lower()
     return [f"{mon}-{d.day}-{d.year}", f"{mon}-{d.day}"]
 
@@ -474,7 +483,7 @@ class Discovery:
                 # bugunku tarih slug'lariyla dene
                 for name in CITIES[ck]["slugs"]:
                     for tmpl in SLUG_TEMPLATES:
-                        for ds in _today_date_slugs(0):
+                        for ds in _today_date_slugs(CITIES[ck]["tz"]):
                             slug = tmpl.format(n=name, d=ds)
                             raw = _fetch_event(self.s.GAMMA_HOST, slug)
                             if not raw:
@@ -601,9 +610,10 @@ class Strategy:
                            "buckets": rows, "signal": sig,
                            "open": f"{city}:{ev.date}" in self.open_pos}
         key = f"{city}:{ev.date}"
-        # "zaten oldu" edge'i GOZLEM gerektirir; H_obs yoksa (METAR basarisiz) girme
+        # "zaten oldu" edge'i: GOZLEM sart (H_obs) + (PEAK_ONLY ise) gunun zirvesi gecmis olmali.
+        peak_ok = ens["peak_passed"] or not self.s.PEAK_ONLY
         if (best is not None and best[0] >= self.s.EDGE_MARGIN and h_obs is not None
-                and key not in self.open_pos):
+                and peak_ok and key not in self.open_pos):
             await self._enter(city, ev, best)
 
     async def _enter(self, city: str, ev: WxEvent, best) -> None:
