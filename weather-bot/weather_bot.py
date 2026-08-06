@@ -585,8 +585,10 @@ class Strategy:
         if ens is None:
             return
         finals = ens["finals"]
+        rh = round(h_obs) if h_obs is not None else None  # yuvarlanmis gozlenen high (resolution birimi)
         rows = []
-        best = None  # (ev_value, bucket, side, token, price, p)
+        best = None         # (ev_value, bucket, side, token, price, p) -- global en iyi EV
+        best_locked = None  # gozlem TEK BASINA kesinlestirmis taraf (zirveden bagimsiz "zaten oldu")
         for b in ev.buckets:
             p = bucket_prob(finals, b.lo, b.hi)
             if p is None:
@@ -594,27 +596,52 @@ class Strategy:
             # fiyat: market outcomePrice (mid) -- hizli; canli girise gercek ask cekilir
             ev_yes = p - b.yes_price - self._fee(b.yes_price) if b.yes_price >= 0 else None
             ev_no = (1 - p) - b.no_price - self._fee(b.no_price) if b.no_price >= 0 else None
+            row_locked = False
             for side, evv, tok, price in (("YES", ev_yes, b.yes_token, b.yes_price),
                                           ("NO", ev_no, b.no_token, b.no_price)):
-                if evv is not None and (best is None or evv > best[0]):
+                if evv is None:
+                    continue
+                if best is None or evv > best[0]:
                     best = (evv, b, side, tok, price, p)
+                # "zaten oldu" KILIDI -- sonuc gozlemle belli, kalan forecast onemsiz:
+                #   NO kesin  -> bucket tamamen gozlenen high'in ALTINDA (round(H) > hi)
+                #   YES kesin -> acik-ust bucket ("T ve uzeri") ve round(H) >= T
+                locked = rh is not None and (
+                    (side == "NO" and b.hi is not None and rh > b.hi)
+                    or (side == "YES" and b.hi is None and b.lo is not None and rh >= b.lo))
+                if locked:
+                    row_locked = True
+                    if best_locked is None or evv > best_locked[0]:
+                        best_locked = (evv, b, side, tok, price, p)
             rows.append({"label": b.label, "p": p, "yes": b.yes_price, "no": b.no_price,
                          "ev_yes": (round(ev_yes, 3) if ev_yes is not None else None),
-                         "ev_no": (round(ev_no, 3) if ev_no is not None else None)})
+                         "ev_no": (round(ev_no, 3) if ev_no is not None else None),
+                         "locked": row_locked})
+        # sinyal: gozlem-kilitli aday varsa onu one cikar (kesin), yoksa global en iyi
+        pick = (best_locked if best_locked is not None and best_locked[0] >= self.s.EDGE_MARGIN
+                else best)
         sig = "-"
-        if best is not None:
-            sig = (f"{best[2]} {best[1].label} (EV={best[0]:+.3f})"
-                   if best[0] >= self.s.EDGE_MARGIN else f"bekle (en iyi EV={best[0]:+.3f})")
+        if pick is not None:
+            lk = " (kilit)" if pick is best_locked else ""
+            sig = (f"{pick[2]} {pick[1].label} (EV={pick[0]:+.3f}){lk}"
+                   if pick[0] >= self.s.EDGE_MARGIN else f"bekle (en iyi EV={pick[0]:+.3f})")
         self.view[city] = {"city": CITIES[city]["name"], "date": ev.date, "h_obs": h_obs,
                            "peak_passed": ens["peak_passed"], "remaining_hours": ens["remaining_hours"],
                            "buckets": rows, "signal": sig,
                            "open": f"{city}:{ev.date}" in self.open_pos}
         key = f"{city}:{ev.date}"
-        # "zaten oldu" edge'i: GOZLEM sart (H_obs) + (PEAK_ONLY ise) gunun zirvesi gecmis olmali.
+        # Giris kapisi:
+        #  (a) GOZLEM-KILITLI taraf -> zirve beklemeden gir (gercek "zaten oldu" edge'i).
+        #  (b) kilit yoksa ve zirve gectiyse -> global en iyi (ensemble-destekli).
+        # Her iki durumda _enter gercek order-book ask'ini teyit eder (sahte 0.000/1.000 elenir).
         peak_ok = ens["peak_passed"] or not self.s.PEAK_ONLY
-        if (best is not None and best[0] >= self.s.EDGE_MARGIN and h_obs is not None
-                and peak_ok and key not in self.open_pos):
-            await self._enter(city, ev, best)
+        cand = None
+        if best_locked is not None and best_locked[0] >= self.s.EDGE_MARGIN:
+            cand = best_locked
+        elif peak_ok and best is not None and best[0] >= self.s.EDGE_MARGIN:
+            cand = best
+        if cand is not None and h_obs is not None and key not in self.open_pos:
+            await self._enter(city, ev, cand)
 
     async def _enter(self, city: str, ev: WxEvent, best) -> None:
         evv, b, side, token, price, p = best
@@ -767,7 +794,7 @@ async function tick(){try{
   q("eq").innerHTML='<polyline fill=none stroke='+(e[e.length-1]>=0?"#2ea043":"#f85149")+' stroke-width=2 points="'+pts+'"/>';}
  q("cities").innerHTML=(d.cities||[]).map(c=>{
   const rows=(c.buckets||[]).map(b=>{const hit=b.p>=0.5;const evy=b.ev_yes,evn=b.ev_no;
-   return "<tr class="+(hit?"hot":"")+"><td>"+b.label+"</td><td>"+(100*b.p).toFixed(0)+"%</td>"
+   return "<tr class="+(hit?"hot":"")+"><td>"+(b.locked?"🔒 ":"")+b.label+"</td><td>"+(100*b.p).toFixed(0)+"%</td>"
    +"<td>"+f(b.yes,3)+"</td><td>"+f(b.no,3)+"</td>"
    +"<td class="+(evy>0.06?"up":"")+">"+(evy==null?"-":(evy>0?"+":"")+f(evy,3))+"</td>"
    +"<td class="+(evn>0.06?"up":"")+">"+(evn==null?"-":(evn>0?"+":"")+f(evn,3))+"</td></tr>";}).join("");
