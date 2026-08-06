@@ -601,25 +601,28 @@ class Strategy:
                            "buckets": rows, "signal": sig,
                            "open": f"{city}:{ev.date}" in self.open_pos}
         key = f"{city}:{ev.date}"
-        if (best is not None and best[0] >= self.s.EDGE_MARGIN and key not in self.open_pos):
+        # "zaten oldu" edge'i GOZLEM gerektirir; H_obs yoksa (METAR basarisiz) girme
+        if (best is not None and best[0] >= self.s.EDGE_MARGIN and h_obs is not None
+                and key not in self.open_pos):
             await self._enter(city, ev, best)
 
     async def _enter(self, city: str, ev: WxEvent, best) -> None:
         evv, b, side, token, price, p = best
-        # canli: gercek ask'i teyit et (mid iyimser olabilir)
+        # PAPER + CANLI: gercek ASK'i teyit et (outcomePrice/mid bayat olabilir).
+        real = await asyncio.to_thread(public_best_ask, token)
+        p_side = p if side == "YES" else (1 - p)
+        if real is None or (p_side - real - self._fee(real)) < self.s.EDGE_MARGIN:
+            self._emit(f"{CITIES[city]['name']} {side} '{b.label}': gercek ask'ta edge yok (mid bayatmis)")
+            return
+        price = real
+        live = False
+        order_id = ""
         if self.live_armed:
-            real = await asyncio.to_thread(public_best_ask, token)
-            if real is None or (p - real - self._fee(real)) < self.s.EDGE_MARGIN:
-                return  # gercek ask'ta edge kalmadi
-            price = real
             oid = await self.clob.buy_fok(token, price, self.s.ORDER_SHARES) or ""
-            if not oid:
-                self._emit(f"CANLI REDDEDILDI {CITIES[city]['name']} {side} {b.label}")
-                live = False; order_id = ""
-            else:
+            if oid:
                 live = True; order_id = oid
-        else:
-            live = False; order_id = ""
+            else:
+                self._emit(f"CANLI REDDEDILDI {CITIES[city]['name']} {side} {b.label}")
         h_obs = (await self._obs(city)) or 0.0
         pos = Position(city=city, date=ev.date, bucket=b.label, lo=b.lo, hi=b.hi, side=side,
                        token=token, entry_price=price, shares=self.s.ORDER_SHARES, p_bucket=p,
